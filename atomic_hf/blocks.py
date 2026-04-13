@@ -197,6 +197,69 @@ def build_fock(h_core: np.ndarray, eri: np.ndarray, density: np.ndarray) -> np.n
     return h_core + coulomb - 0.5 * exchange
 
 
+def build_uhf_fock(
+    h_core: np.ndarray,
+    eri: np.ndarray,
+    density_alpha: np.ndarray,
+    density_beta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    density_total = density_alpha + density_beta
+    coulomb = np.einsum("ls,mnls->mn", density_total, eri, optimize=True)
+    exchange_alpha = np.einsum("ls,mlns->mn", density_alpha, eri, optimize=True)
+    exchange_beta = np.einsum("ls,mlns->mn", density_beta, eri, optimize=True)
+    return h_core + coulomb - exchange_alpha, h_core + coulomb - exchange_beta
+
+
+def combine_spin_blocks(matrix_alpha: np.ndarray, matrix_beta: np.ndarray) -> np.ndarray:
+    zeros = np.zeros_like(matrix_alpha)
+    return np.block([[matrix_alpha, zeros], [zeros, matrix_beta]])
+
+
+def split_spin_blocks(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    nbf = matrix.shape[0] // 2
+    return matrix[:nbf, :nbf], matrix[nbf:, nbf:]
+
+
+def sort_orbitals_by_energy(
+    orbital_energies: np.ndarray,
+    coefficients: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    order = np.argsort(orbital_energies)
+    return orbital_energies[order], coefficients[:, order]
+
+
+def build_spin_mo_occupations(num_occupied: int, num_orbitals: int) -> np.ndarray:
+    occupations = np.zeros(num_orbitals)
+    occupations[:num_occupied] = 1.0
+    return occupations
+
+
+def build_spin_density_from_count(coefficients: np.ndarray, num_occupied: int) -> tuple[np.ndarray, np.ndarray]:
+    occupations = build_spin_mo_occupations(num_occupied, coefficients.shape[1])
+    return build_density_from_occupations(coefficients, occupations), occupations
+
+
+def compute_uhf_s2(
+    overlap: np.ndarray,
+    coeff_alpha: np.ndarray,
+    coeff_beta: np.ndarray,
+    nalpha: int,
+    nbeta: int,
+) -> tuple[float, float, float]:
+    occ_alpha = coeff_alpha[:, :nalpha]
+    occ_beta = coeff_beta[:, :nbeta]
+    if nalpha == 0 or nbeta == 0:
+        overlap_occ = 0.0
+    else:
+        spin_overlap = occ_alpha.T @ overlap @ occ_beta
+        overlap_occ = float(np.sum(np.abs(spin_overlap) ** 2))
+
+    sz = 0.5 * (nalpha - nbeta)
+    s2 = sz * (sz + 1.0) + nbeta - overlap_occ
+    expected_s2 = sz * (sz + 1.0)
+    return s2, expected_s2, s2 - expected_s2
+
+
 def analyze_one_center_integrals(
     mol: gto.Mole,
     overlap: np.ndarray,
@@ -233,4 +296,70 @@ def analyze_one_center_integrals(
         "reduced_radial_dimension": reduced_dimension,
         "one_electron_compression_ratio": float(nao / reduced_dimension) if reduced_dimension else 1.0,
         "block_summaries": block_summaries,
+    }
+
+
+def analyze_two_electron_integrals(
+    mol: gto.Mole,
+    eri: np.ndarray,
+    threshold: float = 1.0e-12,
+) -> dict[str, object]:
+    ao_ang = ao_angular_momentum_for_each_ao(mol)
+    unique_l = sorted(set(int(value) for value in ao_ang))
+    l_indices = {l_value: np.where(ao_ang == l_value)[0] for l_value in unique_l}
+    radial_counts = {
+        l_value: int(l_indices[l_value].size // (2 * l_value + 1))
+        for l_value in unique_l
+    }
+
+    quartet_summaries: list[dict[str, object]] = []
+    active_quartets = 0
+    for l1 in unique_l:
+        idx1 = l_indices[l1]
+        for l2 in unique_l:
+            idx2 = l_indices[l2]
+            for l3 in unique_l:
+                idx3 = l_indices[l3]
+                for l4 in unique_l:
+                    idx4 = l_indices[l4]
+                    block = eri[np.ix_(idx1, idx2, idx3, idx4)]
+                    max_abs = float(np.max(np.abs(block))) if block.size else 0.0
+                    fro_norm = float(np.linalg.norm(block)) if block.size else 0.0
+                    is_active = max_abs > threshold
+                    active_quartets += int(is_active)
+                    quartet_summaries.append(
+                        {
+                            "labels": (
+                                angular_momentum_label(l1),
+                                angular_momentum_label(l2),
+                                angular_momentum_label(l3),
+                                angular_momentum_label(l4),
+                            ),
+                            "l_values": [l1, l2, l3, l4],
+                            "ao_shape": [int(idx1.size), int(idx2.size), int(idx3.size), int(idx4.size)],
+                            "reduced_radial_shape": [
+                                radial_counts[l1],
+                                radial_counts[l2],
+                                radial_counts[l3],
+                                radial_counts[l4],
+                            ],
+                            "max_abs": max_abs,
+                            "frobenius_norm": fro_norm,
+                            "numerically_active": is_active,
+                        }
+                    )
+
+    active_sorted = sorted(
+        (quartet for quartet in quartet_summaries if quartet["numerically_active"]),
+        key=lambda quartet: quartet["frobenius_norm"],
+        reverse=True,
+    )
+    return {
+        "threshold": threshold,
+        "total_angular_quartets": len(quartet_summaries),
+        "active_angular_quartets": active_quartets,
+        "inactive_angular_quartets": len(quartet_summaries) - active_quartets,
+        "active_ratio": float(active_quartets / len(quartet_summaries)) if quartet_summaries else 0.0,
+        "dominant_active_quartets": active_sorted[:12],
+        "quartet_summaries": quartet_summaries,
     }

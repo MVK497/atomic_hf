@@ -1,5 +1,6 @@
 from .atom import (
     AtomicSpec,
+    analyze_basis_engineering,
     atomic_number,
     build_atomic_molecule,
     build_configuration_summary,
@@ -13,6 +14,7 @@ __all__ = [
     "AtomicRHFResult",
     "AtomicSpec",
     "AtomicUHFResult",
+    "analyze_basis_engineering",
     "atomic_number",
     "build_atomic_molecule",
     "build_configuration_summary",

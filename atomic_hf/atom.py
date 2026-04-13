@@ -32,7 +32,7 @@ AUFBAU_ORDER: list[tuple[int, str, int]] = [
 @dataclass(frozen=True)
 class AtomicSpec:
     symbol: str
-    basis: str = "sto-3g"
+    basis: object = "sto-3g"
     charge: int = 0
     spin: int | None = None
     title: str | None = None
@@ -162,3 +162,75 @@ def summarize_basis_shells(mol: gto.Mole) -> list[dict[str, int | str]]:
         entry["primitive_functions"] += nprim
         entry["aos"] += nctr * degeneracy
     return [summary[key] for key in sorted(summary)]
+
+
+def analyze_basis_engineering(mol: gto.Mole) -> dict[str, object]:
+    symbol = canonical_symbol(mol.atom_symbol(0))
+    raw_basis = mol._basis[symbol]
+    shell_summaries: list[dict[str, object]] = []
+    angular_summary: dict[int, dict[str, object]] = {}
+    general_shells = 0
+    segmented_shells = 0
+
+    for shell_index, shell in enumerate(raw_basis, start=1):
+        l_value = int(shell[0])
+        primitives = shell[1:]
+        nprim = len(primitives)
+        nctr = len(primitives[0]) - 1 if primitives else 0
+        contraction_type = "general" if nctr > 1 else "segmented"
+        if contraction_type == "general":
+            general_shells += 1
+        else:
+            segmented_shells += 1
+
+        shell_summary = {
+            "shell_index": shell_index,
+            "l": l_value,
+            "label": angular_momentum_label(l_value),
+            "primitives": nprim,
+            "contracted_radial_functions": nctr,
+            "contraction_type": contraction_type,
+            "coefficient_entries": nprim * nctr,
+            "contraction_signature": f"{nprim}->{nctr}",
+        }
+        shell_summaries.append(shell_summary)
+
+        if l_value not in angular_summary:
+            angular_summary[l_value] = {
+                "l": l_value,
+                "label": angular_momentum_label(l_value),
+                "shells": 0,
+                "general_shells": 0,
+                "segmented_shells": 0,
+                "primitives": 0,
+                "contracted_radial_functions": 0,
+                "coefficient_entries": 0,
+                "max_primitives_per_shell": 0,
+                "max_contractions_per_shell": 0,
+            }
+        entry = angular_summary[l_value]
+        entry["shells"] += 1
+        entry["general_shells"] += int(contraction_type == "general")
+        entry["segmented_shells"] += int(contraction_type == "segmented")
+        entry["primitives"] += nprim
+        entry["contracted_radial_functions"] += nctr
+        entry["coefficient_entries"] += nprim * nctr
+        entry["max_primitives_per_shell"] = max(int(entry["max_primitives_per_shell"]), nprim)
+        entry["max_contractions_per_shell"] = max(int(entry["max_contractions_per_shell"]), nctr)
+
+    total_primitives = sum(int(shell["primitives"]) for shell in shell_summaries)
+    total_contracted = sum(int(shell["contracted_radial_functions"]) for shell in shell_summaries)
+    total_entries = sum(int(shell["coefficient_entries"]) for shell in shell_summaries)
+    return {
+        "symbol": symbol,
+        "has_general_contractions": general_shells > 0,
+        "general_shells": general_shells,
+        "segmented_shells": segmented_shells,
+        "total_shells": len(shell_summaries),
+        "total_primitives": total_primitives,
+        "total_contracted_radial_functions": total_contracted,
+        "total_coefficient_entries": total_entries,
+        "global_contraction_ratio": float(total_contracted / total_primitives) if total_primitives else 0.0,
+        "shell_summaries": shell_summaries,
+        "angular_momentum_summary": [angular_summary[key] for key in sorted(angular_summary)],
+    }

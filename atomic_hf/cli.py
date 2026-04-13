@@ -57,6 +57,26 @@ def print_basis_summary(basis_summary: list[dict[str, int | str]]) -> None:
         )
 
 
+def print_basis_engineering_summary(summary: dict[str, object]) -> None:
+    print()
+    print("Basis engineering summary")
+    print(f"  Total shells: {summary['total_shells']}")
+    print(f"  General-contracted shells: {summary['general_shells']}")
+    print(f"  Segmented shells: {summary['segmented_shells']}")
+    print(f"  Has general contractions: {summary['has_general_contractions']}")
+    print(f"  Total primitives: {summary['total_primitives']}")
+    print(f"  Total contracted radial functions: {summary['total_contracted_radial_functions']}")
+    print(f"  Global contraction ratio: {summary['global_contraction_ratio']:.3f}")
+    print("  Angular-momentum contraction structure:")
+    for block in summary["angular_momentum_summary"]:
+        print(
+            f"    {block['label']}-type: shells = {block['shells']}, "
+            f"general = {block['general_shells']}, segmented = {block['segmented_shells']}, "
+            f"primitives = {block['primitives']}, contractions = {block['contracted_radial_functions']}, "
+            f"max shell signature = {block['max_primitives_per_shell']}->{block['max_contractions_per_shell']}"
+        )
+
+
 def print_one_center_integral_summary(summary: dict[str, object]) -> None:
     print()
     print("One-center integral reduction")
@@ -73,12 +93,51 @@ def print_one_center_integral_summary(summary: dict[str, object]) -> None:
         )
 
 
+def print_two_electron_integral_summary(summary: dict[str, object]) -> None:
+    print()
+    print("One-center two-electron integral structure")
+    print(f"  Threshold: {summary['threshold']:.1e}")
+    print(f"  Total angular quartets: {summary['total_angular_quartets']}")
+    print(f"  Active angular quartets: {summary['active_angular_quartets']}")
+    print(f"  Inactive angular quartets: {summary['inactive_angular_quartets']}")
+    print(f"  Active ratio: {summary['active_ratio']:.3f}")
+    print("  Dominant active quartets:")
+    for quartet in summary["dominant_active_quartets"]:
+        labels = ",".join(quartet["labels"])
+        print(
+            f"    ({labels}): ao = {quartet['ao_shape']}, "
+            f"reduced = {quartet['reduced_radial_shape']}, "
+            f"max|eri| = {quartet['max_abs']:.3e}, "
+            f"||eri|| = {quartet['frobenius_norm']:.3e}"
+        )
+
+
 def print_symmetry_blocks(blocks: list[dict[str, int | str]]) -> None:
     print()
     print("Symmetry-blocked diagonalization")
     for block in blocks:
         print(
             f"  {block['label']}-block: degeneracy = {block['degeneracy']}, "
+            f"AO count = {block['ao_count']}, radial functions = {block['radial_functions']}"
+        )
+
+
+def print_spin_symmetry_blocks(
+    blocks_alpha: list[dict[str, int | str]],
+    blocks_beta: list[dict[str, int | str]],
+) -> None:
+    print()
+    print("Symmetry-blocked UHF diagonalization")
+    print("  Alpha blocks:")
+    for block in blocks_alpha:
+        print(
+            f"    {block['label']}-block: degeneracy = {block['degeneracy']}, "
+            f"AO count = {block['ao_count']}, radial functions = {block['radial_functions']}"
+        )
+    print("  Beta blocks:")
+    for block in blocks_beta:
+        print(
+            f"    {block['label']}-block: degeneracy = {block['degeneracy']}, "
             f"AO count = {block['ao_count']}, radial functions = {block['radial_functions']}"
         )
 
@@ -97,8 +156,10 @@ def print_rhf_result(result: AtomicRHFResult, show_history: bool) -> None:
         print(f"  MO {index:>2d}: occ = {occ:>4.1f}   eps = {energy: .12f} Eh")
 
     print_basis_summary(result.basis_summary)
+    print_basis_engineering_summary(result.basis_engineering_summary)
     print_symmetry_blocks(result.symmetry_blocks)
     print_one_center_integral_summary(result.one_center_integral_summary)
+    print_two_electron_integral_summary(result.two_electron_integral_summary)
 
     if show_history:
         print()
@@ -112,6 +173,7 @@ def print_uhf_result(result: AtomicUHFResult, show_history: bool) -> None:
     print("Atomic UHF Result")
     print(f"Basis: {result.basis}")
     print(f"Spin (2S): {result.spin}")
+    print("Blocked atomic solver: True")
     print(f"Alpha electrons: {result.nalpha}")
     print(f"Beta electrons: {result.nbeta}")
     print(f"SCF iterations: {result.iterations}")
@@ -135,7 +197,10 @@ def print_uhf_result(result: AtomicUHFResult, show_history: bool) -> None:
         print(f"  bMO {index:>2d}: occ = {occ:>4.1f}   eps = {energy: .12f} Eh")
 
     print_basis_summary(result.basis_summary)
+    print_basis_engineering_summary(result.basis_engineering_summary)
+    print_spin_symmetry_blocks(result.symmetry_blocks_alpha, result.symmetry_blocks_beta)
     print_one_center_integral_summary(result.one_center_integral_summary)
+    print_two_electron_integral_summary(result.two_electron_integral_summary)
 
     if show_history:
         print()

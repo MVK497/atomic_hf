@@ -6,6 +6,7 @@ import numpy as np
 
 from .atom import (
     AtomicSpec,
+    analyze_basis_engineering,
     build_atomic_molecule,
     build_configuration_summary,
     canonical_symbol,
@@ -15,6 +16,7 @@ from .atom import (
 from .blocks import (
     DIISHelper,
     analyze_one_center_integrals,
+    analyze_two_electron_integrals,
     blocked_generalized_eigh,
     build_atomic_mo_occupations,
     build_density_from_occupations,
@@ -38,9 +40,11 @@ class AtomicRHFResult:
     iterations: int
     history: list[float]
     basis_summary: list[dict[str, int | str]]
+    basis_engineering_summary: dict[str, object]
     configuration_summary: dict[str, object]
     symmetry_blocks: list[dict[str, int | str]]
     one_center_integral_summary: dict[str, object]
+    two_electron_integral_summary: dict[str, object]
     spherical_average: bool
 
 
@@ -112,9 +116,11 @@ def run_atomic_rhf(
                 iterations=iteration,
                 history=history,
                 basis_summary=summarize_basis_shells(mol),
+                basis_engineering_summary=analyze_basis_engineering(mol),
                 configuration_summary=build_configuration_summary(spec),
                 symmetry_blocks=symmetry_blocks,
                 one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core),
+                two_electron_integral_summary=analyze_two_electron_integrals(mol, eri),
                 spherical_average=True,
             )
 
