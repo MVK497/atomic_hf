@@ -20,7 +20,8 @@ from .blocks import (
     blocked_generalized_eigh,
     build_atomic_mo_occupations,
     build_density_from_occupations,
-    build_fock,
+    build_active_eri_quartets,
+    build_fock_from_active_quartets,
     compute_diis_error,
 )
 
@@ -70,6 +71,7 @@ def run_atomic_rhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
+    active_quartets = build_active_eri_quartets(mol, eri)
 
     mo_occ = build_atomic_mo_occupations(mol)
     history: list[float] = []
@@ -83,7 +85,7 @@ def run_atomic_rhf(
     x = overlap_eigvecs @ np.diag(overlap_eigvals ** -0.5) @ overlap_eigvecs.T
 
     for iteration in range(1, max_iter + 1):
-        fock = build_fock(h_core, eri, density)
+        fock = build_fock_from_active_quartets(h_core, eri, density, active_quartets)
         if use_diis:
             diis_error = compute_diis_error(fock, density, s, x)
             diis_helper.push(fock, diis_error)
@@ -93,7 +95,7 @@ def run_atomic_rhf(
 
         orbital_energies, coefficients, symmetry_blocks = blocked_generalized_eigh(fock_to_diagonalize, s, mol)
         new_density = build_density_from_occupations(coefficients, mo_occ)
-        new_fock = build_fock(h_core, eri, new_density)
+        new_fock = build_fock_from_active_quartets(h_core, eri, new_density, active_quartets)
         electronic_energy = 0.5 * float(np.sum(new_density * (h_core + new_fock)))
         total_energy = electronic_energy + e_nuc
         history.append(total_energy)

@@ -17,8 +17,9 @@ from .blocks import (
     analyze_one_center_integrals,
     analyze_two_electron_integrals,
     blocked_generalized_eigh,
+    build_active_eri_quartets,
     build_spin_density_from_count,
-    build_uhf_fock,
+    build_uhf_fock_from_active_quartets,
     combine_spin_blocks,
     compute_diis_error,
     compute_uhf_s2,
@@ -82,6 +83,7 @@ def run_atomic_uhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
+    active_quartets = build_active_eri_quartets(mol, eri)
 
     overlap_eigvals, overlap_eigvecs = np.linalg.eigh(s)
     x = overlap_eigvecs @ np.diag(overlap_eigvals ** -0.5) @ overlap_eigvecs.T
@@ -97,7 +99,13 @@ def run_atomic_uhf(
 
     previous_energy: float | None = None
     for iteration in range(1, max_iter + 1):
-        fock_alpha, fock_beta = build_uhf_fock(h_core, eri, density_alpha, density_beta)
+        fock_alpha, fock_beta = build_uhf_fock_from_active_quartets(
+            h_core,
+            eri,
+            density_alpha,
+            density_beta,
+            active_quartets,
+        )
         if use_diis:
             error_alpha = compute_diis_error(fock_alpha, density_alpha, s, x)
             error_beta = compute_diis_error(fock_beta, density_beta, s, x)
@@ -120,7 +128,13 @@ def run_atomic_uhf(
 
         new_density_alpha, mo_occ_alpha = build_spin_density_from_count(coefficients_alpha, nalpha)
         new_density_beta, mo_occ_beta = build_spin_density_from_count(coefficients_beta, nbeta)
-        new_fock_alpha, new_fock_beta = build_uhf_fock(h_core, eri, new_density_alpha, new_density_beta)
+        new_fock_alpha, new_fock_beta = build_uhf_fock_from_active_quartets(
+            h_core,
+            eri,
+            new_density_alpha,
+            new_density_beta,
+            active_quartets,
+        )
 
         electronic_energy = 0.5 * (
             np.sum((new_density_alpha + new_density_beta) * h_core)

@@ -50,6 +50,20 @@ class DIISHelper:
         return sum(coeff * fock for coeff, fock in zip(coefficients, self.fock_matrices, strict=True))
 
 
+@dataclass(frozen=True)
+class ActiveERIQuartet:
+    l_values: tuple[int, int, int, int]
+    labels: tuple[str, str, str, str]
+    idx_p: np.ndarray
+    idx_q: np.ndarray
+    idx_r: np.ndarray
+    idx_s: np.ndarray
+    ao_shape: tuple[int, int, int, int]
+    reduced_radial_shape: tuple[int, int, int, int]
+    max_abs: float
+    frobenius_norm: float
+
+
 def compute_diis_error(fock: np.ndarray, density: np.ndarray, overlap: np.ndarray, x: np.ndarray) -> np.ndarray:
     commutator = fock @ density @ overlap - overlap @ density @ fock
     return x.T @ commutator @ x
@@ -197,6 +211,84 @@ def build_fock(h_core: np.ndarray, eri: np.ndarray, density: np.ndarray) -> np.n
     return h_core + coulomb - 0.5 * exchange
 
 
+def build_active_eri_quartets(
+    mol: gto.Mole,
+    eri: np.ndarray,
+    threshold: float = 1.0e-12,
+) -> list[ActiveERIQuartet]:
+    ao_ang = ao_angular_momentum_for_each_ao(mol)
+    unique_l = sorted(set(int(value) for value in ao_ang))
+    l_indices = {l_value: np.where(ao_ang == l_value)[0] for l_value in unique_l}
+    radial_counts = {
+        l_value: int(l_indices[l_value].size // (2 * l_value + 1))
+        for l_value in unique_l
+    }
+
+    active_quartets: list[ActiveERIQuartet] = []
+    for l1 in unique_l:
+        idx1 = l_indices[l1]
+        for l2 in unique_l:
+            idx2 = l_indices[l2]
+            for l3 in unique_l:
+                idx3 = l_indices[l3]
+                for l4 in unique_l:
+                    idx4 = l_indices[l4]
+                    block = eri[np.ix_(idx1, idx2, idx3, idx4)]
+                    max_abs = float(np.max(np.abs(block))) if block.size else 0.0
+                    if max_abs <= threshold:
+                        continue
+                    active_quartets.append(
+                        ActiveERIQuartet(
+                            l_values=(l1, l2, l3, l4),
+                            labels=(
+                                angular_momentum_label(l1),
+                                angular_momentum_label(l2),
+                                angular_momentum_label(l3),
+                                angular_momentum_label(l4),
+                            ),
+                            idx_p=idx1,
+                            idx_q=idx2,
+                            idx_r=idx3,
+                            idx_s=idx4,
+                            ao_shape=(int(idx1.size), int(idx2.size), int(idx3.size), int(idx4.size)),
+                            reduced_radial_shape=(
+                                radial_counts[l1],
+                                radial_counts[l2],
+                                radial_counts[l3],
+                                radial_counts[l4],
+                            ),
+                            max_abs=max_abs,
+                            frobenius_norm=float(np.linalg.norm(block)),
+                        )
+                    )
+    return active_quartets
+
+
+def build_fock_from_active_quartets(
+    h_core: np.ndarray,
+    eri: np.ndarray,
+    density: np.ndarray,
+    active_quartets: list[ActiveERIQuartet],
+) -> np.ndarray:
+    fock = np.array(h_core, copy=True)
+    for quartet in active_quartets:
+        density_rs = density[np.ix_(quartet.idx_r, quartet.idx_s)]
+        coulomb_block = np.einsum(
+            "rs,pqrs->pq",
+            density_rs,
+            eri[np.ix_(quartet.idx_p, quartet.idx_q, quartet.idx_r, quartet.idx_s)],
+            optimize=True,
+        )
+        exchange_block = np.einsum(
+            "rs,prqs->pq",
+            density_rs,
+            eri[np.ix_(quartet.idx_p, quartet.idx_r, quartet.idx_q, quartet.idx_s)],
+            optimize=True,
+        )
+        fock[np.ix_(quartet.idx_p, quartet.idx_q)] += coulomb_block - 0.5 * exchange_block
+    return fock
+
+
 def build_uhf_fock(
     h_core: np.ndarray,
     eri: np.ndarray,
@@ -208,6 +300,36 @@ def build_uhf_fock(
     exchange_alpha = np.einsum("ls,mlns->mn", density_alpha, eri, optimize=True)
     exchange_beta = np.einsum("ls,mlns->mn", density_beta, eri, optimize=True)
     return h_core + coulomb - exchange_alpha, h_core + coulomb - exchange_beta
+
+
+def build_uhf_fock_from_active_quartets(
+    h_core: np.ndarray,
+    eri: np.ndarray,
+    density_alpha: np.ndarray,
+    density_beta: np.ndarray,
+    active_quartets: list[ActiveERIQuartet],
+) -> tuple[np.ndarray, np.ndarray]:
+    fock_alpha = np.array(h_core, copy=True)
+    fock_beta = np.array(h_core, copy=True)
+    density_total = density_alpha + density_beta
+
+    for quartet in active_quartets:
+        eri_coulomb = eri[np.ix_(quartet.idx_p, quartet.idx_q, quartet.idx_r, quartet.idx_s)]
+        eri_exchange = eri[np.ix_(quartet.idx_p, quartet.idx_r, quartet.idx_q, quartet.idx_s)]
+
+        density_total_rs = density_total[np.ix_(quartet.idx_r, quartet.idx_s)]
+        density_alpha_rs = density_alpha[np.ix_(quartet.idx_r, quartet.idx_s)]
+        density_beta_rs = density_beta[np.ix_(quartet.idx_r, quartet.idx_s)]
+
+        coulomb_block = np.einsum("rs,pqrs->pq", density_total_rs, eri_coulomb, optimize=True)
+        exchange_alpha_block = np.einsum("rs,prqs->pq", density_alpha_rs, eri_exchange, optimize=True)
+        exchange_beta_block = np.einsum("rs,prqs->pq", density_beta_rs, eri_exchange, optimize=True)
+
+        output_index = np.ix_(quartet.idx_p, quartet.idx_q)
+        fock_alpha[output_index] += coulomb_block - exchange_alpha_block
+        fock_beta[output_index] += coulomb_block - exchange_beta_block
+
+    return fock_alpha, fock_beta
 
 
 def combine_spin_blocks(matrix_alpha: np.ndarray, matrix_beta: np.ndarray) -> np.ndarray:
@@ -304,16 +426,16 @@ def analyze_two_electron_integrals(
     eri: np.ndarray,
     threshold: float = 1.0e-12,
 ) -> dict[str, object]:
+    active_quartets = build_active_eri_quartets(mol, eri, threshold=threshold)
+    active_quartet_map = {quartet.l_values: quartet for quartet in active_quartets}
+
     ao_ang = ao_angular_momentum_for_each_ao(mol)
     unique_l = sorted(set(int(value) for value in ao_ang))
     l_indices = {l_value: np.where(ao_ang == l_value)[0] for l_value in unique_l}
-    radial_counts = {
-        l_value: int(l_indices[l_value].size // (2 * l_value + 1))
-        for l_value in unique_l
-    }
+    radial_counts = {l_value: int(l_indices[l_value].size // (2 * l_value + 1)) for l_value in unique_l}
 
     quartet_summaries: list[dict[str, object]] = []
-    active_quartets = 0
+    active_count = 0
     for l1 in unique_l:
         idx1 = l_indices[l1]
         for l2 in unique_l:
@@ -322,11 +444,17 @@ def analyze_two_electron_integrals(
                 idx3 = l_indices[l3]
                 for l4 in unique_l:
                     idx4 = l_indices[l4]
-                    block = eri[np.ix_(idx1, idx2, idx3, idx4)]
-                    max_abs = float(np.max(np.abs(block))) if block.size else 0.0
-                    fro_norm = float(np.linalg.norm(block)) if block.size else 0.0
-                    is_active = max_abs > threshold
-                    active_quartets += int(is_active)
+                    quartet_key = (l1, l2, l3, l4)
+                    active_quartet = active_quartet_map.get(quartet_key)
+                    if active_quartet is None:
+                        max_abs = 0.0
+                        fro_norm = 0.0
+                        is_active = False
+                    else:
+                        max_abs = active_quartet.max_abs
+                        fro_norm = active_quartet.frobenius_norm
+                        is_active = True
+                        active_count += 1
                     quartet_summaries.append(
                         {
                             "labels": (
@@ -357,9 +485,9 @@ def analyze_two_electron_integrals(
     return {
         "threshold": threshold,
         "total_angular_quartets": len(quartet_summaries),
-        "active_angular_quartets": active_quartets,
-        "inactive_angular_quartets": len(quartet_summaries) - active_quartets,
-        "active_ratio": float(active_quartets / len(quartet_summaries)) if quartet_summaries else 0.0,
+        "active_angular_quartets": active_count,
+        "inactive_angular_quartets": len(quartet_summaries) - active_count,
+        "active_ratio": float(active_count / len(quartet_summaries)) if quartet_summaries else 0.0,
         "dominant_active_quartets": active_sorted[:12],
         "quartet_summaries": quartet_summaries,
     }

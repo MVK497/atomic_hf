@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 from pyscf import gto
 from pyscf import scf
 from pyscf.scf import atom_hf as pyscf_atom_hf
@@ -12,6 +13,13 @@ from atomic_hf import (
     resolve_spin,
     run_atomic_rhf,
     run_atomic_uhf,
+)
+from atomic_hf.blocks import (
+    build_active_eri_quartets,
+    build_fock,
+    build_fock_from_active_quartets,
+    build_uhf_fock,
+    build_uhf_fock_from_active_quartets,
 )
 
 
@@ -90,3 +98,64 @@ def test_basis_engineering_detects_general_contraction() -> None:
     assert summary["general_shells"] == 1
     assert summary["total_contracted_radial_functions"] == 2
     assert summary["shell_summaries"][0]["contraction_signature"] == "3->2"
+
+
+def test_quartet_screened_rhf_fock_matches_dense_builder() -> None:
+    mol = build_atomic_molecule(AtomicSpec(symbol="Ne", basis="sto-3g", spin=0))
+    h_core = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+    eri = mol.intor("int2e")
+    density = np.array(
+        [
+            [1.02, 0.03, -0.01, 0.00, 0.00],
+            [0.03, 0.91, 0.02, 0.01, -0.01],
+            [-0.01, 0.02, 0.44, 0.00, 0.02],
+            [0.00, 0.01, 0.00, 0.45, 0.00],
+            [0.00, -0.01, 0.02, 0.00, 0.43],
+        ]
+    )
+    density = 0.5 * (density + density.T)
+    active_quartets = build_active_eri_quartets(mol, eri)
+
+    dense_fock = build_fock(h_core, eri, density)
+    screened_fock = build_fock_from_active_quartets(h_core, eri, density, active_quartets)
+
+    assert np.allclose(screened_fock, dense_fock, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_quartet_screened_uhf_fock_matches_dense_builder() -> None:
+    mol = build_atomic_molecule(AtomicSpec(symbol="O", basis="sto-3g", spin=2))
+    h_core = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+    eri = mol.intor("int2e")
+    density_alpha = np.array(
+        [
+            [1.01, 0.02, 0.00, 0.01, -0.01],
+            [0.02, 0.88, 0.01, 0.00, 0.01],
+            [0.00, 0.01, 0.36, 0.02, 0.00],
+            [0.01, 0.00, 0.02, 0.35, -0.01],
+            [-0.01, 0.01, 0.00, -0.01, 0.34],
+        ]
+    )
+    density_beta = np.array(
+        [
+            [0.99, -0.01, 0.01, 0.00, 0.00],
+            [-0.01, 0.79, 0.00, -0.01, 0.01],
+            [0.01, 0.00, 0.25, 0.00, 0.01],
+            [0.00, -0.01, 0.00, 0.24, 0.00],
+            [0.00, 0.01, 0.01, 0.00, 0.23],
+        ]
+    )
+    density_alpha = 0.5 * (density_alpha + density_alpha.T)
+    density_beta = 0.5 * (density_beta + density_beta.T)
+    active_quartets = build_active_eri_quartets(mol, eri)
+
+    dense_alpha, dense_beta = build_uhf_fock(h_core, eri, density_alpha, density_beta)
+    screened_alpha, screened_beta = build_uhf_fock_from_active_quartets(
+        h_core,
+        eri,
+        density_alpha,
+        density_beta,
+        active_quartets,
+    )
+
+    assert np.allclose(screened_alpha, dense_alpha, atol=1.0e-12, rtol=1.0e-12)
+    assert np.allclose(screened_beta, dense_beta, atol=1.0e-12, rtol=1.0e-12)
