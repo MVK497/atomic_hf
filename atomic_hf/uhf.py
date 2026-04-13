@@ -10,20 +10,25 @@ from .atom import (
     build_atomic_molecule,
     build_configuration_summary,
     canonical_symbol,
+    resolve_spin,
     summarize_basis_shells,
 )
 from .blocks import (
     DIISHelper,
+    apply_level_shift,
     analyze_one_center_integrals,
     analyze_two_electron_integrals,
     blocked_generalized_eigh,
-    build_active_eri_quartets,
-    build_spin_density_from_count,
+    build_atomic_reference_density,
+    build_spin_density_from_block_occupations,
+    build_spin_population_by_l,
+    build_structured_eri_repository,
     build_uhf_fock_from_active_quartets,
     combine_spin_blocks,
     compute_diis_error,
     compute_uhf_s2,
-    sort_orbitals_by_energy,
+    damp_density,
+    rebalance_spin_population_by_l,
     split_spin_blocks,
 )
 
@@ -58,6 +63,9 @@ class AtomicUHFResult:
     symmetry_blocks_beta: list[dict[str, int | str]]
     one_center_integral_summary: dict[str, object]
     two_electron_integral_summary: dict[str, object]
+    initial_guess: str
+    stabilization_summary: dict[str, object]
+    fock_build_summary: dict[str, object]
 
 
 def run_atomic_uhf(
@@ -67,12 +75,13 @@ def run_atomic_uhf(
     d_tol: float = 1.0e-8,
     use_diis: bool = True,
     diis_space: int = 6,
+    initial_guess: str = "atom",
+    damping_factor: float = 0.2,
+    damping_cycles: int = 6,
+    level_shift: float = 0.5,
+    diis_start_cycle: int = 3,
 ) -> AtomicUHFResult:
-    if spec.spin is None:
-        raise ValueError(
-            "Atomic UHF currently requires an explicit spin (2S). "
-            "This avoids silently choosing the wrong open-shell state."
-        )
+    resolved_spin = resolve_spin(spec)
 
     mol = build_atomic_molecule(spec)
     nalpha, nbeta = mol.nelec
@@ -83,7 +92,7 @@ def run_atomic_uhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
-    active_quartets = build_active_eri_quartets(mol, eri)
+    structured_eri = build_structured_eri_repository(mol, eri)
 
     overlap_eigvals, overlap_eigvecs = np.linalg.eigh(s)
     x = overlap_eigvecs @ np.diag(overlap_eigvals ** -0.5) @ overlap_eigvecs.T
@@ -92,21 +101,41 @@ def run_atomic_uhf(
 
     orbital_energies_alpha, coefficients_alpha, symmetry_blocks_alpha = blocked_generalized_eigh(h_core, s, mol)
     orbital_energies_beta, coefficients_beta, symmetry_blocks_beta = blocked_generalized_eigh(h_core, s, mol)
-    orbital_energies_alpha, coefficients_alpha = sort_orbitals_by_energy(orbital_energies_alpha, coefficients_alpha)
-    orbital_energies_beta, coefficients_beta = sort_orbitals_by_energy(orbital_energies_beta, coefficients_beta)
-    density_alpha, mo_occ_alpha = build_spin_density_from_count(coefficients_alpha, nalpha)
-    density_beta, mo_occ_beta = build_spin_density_from_count(coefficients_beta, nbeta)
+
+    alpha_by_l, beta_by_l = build_spin_population_by_l(spec)
+    alpha_by_l, beta_by_l = rebalance_spin_population_by_l(alpha_by_l, beta_by_l, nalpha, nbeta)
+    density_alpha_core, mo_occ_alpha = build_spin_density_from_block_occupations(
+        coefficients_alpha,
+        symmetry_blocks_alpha,
+        alpha_by_l,
+    )
+    density_beta_core, mo_occ_beta = build_spin_density_from_block_occupations(
+        coefficients_beta,
+        symmetry_blocks_beta,
+        beta_by_l,
+    )
+    if initial_guess == "atom":
+        density_total = build_atomic_reference_density(mol)
+        spin_density = density_alpha_core - density_beta_core
+        density_alpha = 0.5 * (density_total + spin_density)
+        density_beta = 0.5 * (density_total - spin_density)
+    elif initial_guess == "core":
+        density_alpha = density_alpha_core
+        density_beta = density_beta_core
+    else:
+        raise ValueError("UHF initial_guess must be 'atom' or 'core'.")
+    density_alpha = 0.5 * (density_alpha + density_alpha.T)
+    density_beta = 0.5 * (density_beta + density_beta.T)
 
     previous_energy: float | None = None
     for iteration in range(1, max_iter + 1):
         fock_alpha, fock_beta = build_uhf_fock_from_active_quartets(
             h_core,
-            eri,
             density_alpha,
             density_beta,
-            active_quartets,
+            structured_eri,
         )
-        if use_diis:
+        if use_diis and iteration >= diis_start_cycle:
             error_alpha = compute_diis_error(fock_alpha, density_alpha, s, x)
             error_beta = compute_diis_error(fock_beta, density_beta, s, x)
             diis_helper.push(
@@ -116,6 +145,8 @@ def run_atomic_uhf(
             fock_alpha_to_diag, fock_beta_to_diag = split_spin_blocks(diis_helper.extrapolate())
         else:
             fock_alpha_to_diag, fock_beta_to_diag = fock_alpha, fock_beta
+        fock_alpha_to_diag = apply_level_shift(fock_alpha_to_diag, s, coefficients_alpha, mo_occ_alpha, level_shift)
+        fock_beta_to_diag = apply_level_shift(fock_beta_to_diag, s, coefficients_beta, mo_occ_beta, level_shift)
 
         orbital_energies_alpha, coefficients_alpha, symmetry_blocks_alpha = blocked_generalized_eigh(
             fock_alpha_to_diag, s, mol
@@ -123,17 +154,25 @@ def run_atomic_uhf(
         orbital_energies_beta, coefficients_beta, symmetry_blocks_beta = blocked_generalized_eigh(
             fock_beta_to_diag, s, mol
         )
-        orbital_energies_alpha, coefficients_alpha = sort_orbitals_by_energy(orbital_energies_alpha, coefficients_alpha)
-        orbital_energies_beta, coefficients_beta = sort_orbitals_by_energy(orbital_energies_beta, coefficients_beta)
 
-        new_density_alpha, mo_occ_alpha = build_spin_density_from_count(coefficients_alpha, nalpha)
-        new_density_beta, mo_occ_beta = build_spin_density_from_count(coefficients_beta, nbeta)
+        new_density_alpha, mo_occ_alpha = build_spin_density_from_block_occupations(
+            coefficients_alpha,
+            symmetry_blocks_alpha,
+            alpha_by_l,
+        )
+        new_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
+            coefficients_beta,
+            symmetry_blocks_beta,
+            beta_by_l,
+        )
+        if damping_factor > 0.0 and iteration <= damping_cycles:
+            new_density_alpha = damp_density(density_alpha, new_density_alpha, damping_factor)
+            new_density_beta = damp_density(density_beta, new_density_beta, damping_factor)
         new_fock_alpha, new_fock_beta = build_uhf_fock_from_active_quartets(
             h_core,
-            eri,
             new_density_alpha,
             new_density_beta,
-            active_quartets,
+            structured_eri,
         )
 
         electronic_energy = 0.5 * (
@@ -157,27 +196,31 @@ def run_atomic_uhf(
             orbital_energies_beta, coefficients_beta, symmetry_blocks_beta = blocked_generalized_eigh(
                 new_fock_beta, s, mol
             )
-            orbital_energies_alpha, coefficients_alpha = sort_orbitals_by_energy(
-                orbital_energies_alpha, coefficients_alpha
+            final_density_alpha, mo_occ_alpha = build_spin_density_from_block_occupations(
+                coefficients_alpha,
+                symmetry_blocks_alpha,
+                alpha_by_l,
             )
-            orbital_energies_beta, coefficients_beta = sort_orbitals_by_energy(
-                orbital_energies_beta, coefficients_beta
+            final_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
+                coefficients_beta,
+                symmetry_blocks_beta,
+                beta_by_l,
             )
-            final_density_alpha, mo_occ_alpha = build_spin_density_from_count(coefficients_alpha, nalpha)
-            final_density_beta, mo_occ_beta = build_spin_density_from_count(coefficients_beta, nbeta)
             s2, expected_s2, spin_contamination = compute_uhf_s2(
                 s,
                 coefficients_alpha,
                 coefficients_beta,
                 nalpha,
                 nbeta,
+                mo_occ_alpha=mo_occ_alpha,
+                mo_occ_beta=mo_occ_beta,
             )
             configuration_summary = build_configuration_summary(spec)
             return AtomicUHFResult(
                 symbol=canonical_symbol(spec.symbol),
                 atomic_number=int(configuration_summary["atomic_number"]),
                 charge=spec.charge,
-                spin=mol.spin,
+                spin=resolved_spin,
                 basis=spec.basis,
                 energy=total_energy,
                 orbital_energies_alpha=np.array(orbital_energies_alpha, copy=True),
@@ -202,6 +245,20 @@ def run_atomic_uhf(
                 symmetry_blocks_beta=symmetry_blocks_beta,
                 one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core),
                 two_electron_integral_summary=analyze_two_electron_integrals(mol, eri),
+                initial_guess=initial_guess,
+                stabilization_summary={
+                    "use_diis": use_diis,
+                    "diis_space": diis_space,
+                    "diis_start_cycle": diis_start_cycle,
+                    "damping_factor": damping_factor,
+                    "damping_cycles": damping_cycles,
+                    "level_shift": level_shift,
+                },
+                fock_build_summary={
+                    "builder": "structured_one_center_quartets",
+                    "active_angular_quartets": len(structured_eri.active_quartets),
+                    "unique_canonical_blocks": len(structured_eri.block_map),
+                },
             )
 
         density_alpha = new_density_alpha

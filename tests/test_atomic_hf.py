@@ -11,6 +11,7 @@ from atomic_hf import (
     build_atomic_molecule,
     build_configuration_summary,
     resolve_spin,
+    run_benchmark_sweep,
     run_atomic_rhf,
     run_atomic_uhf,
 )
@@ -29,6 +30,14 @@ def test_default_spin_estimate_for_oxygen() -> None:
     assert summary["estimated_configuration"] == "1s^2 2s^2 2p^4"
     assert summary["estimated_default_spin"] == 2
     assert resolve_spin(spec) == 2
+
+
+def test_reference_configuration_captures_chromium_exception() -> None:
+    spec = AtomicSpec(symbol="Cr")
+    summary = build_configuration_summary(spec)
+    assert summary["estimated_configuration"] == "1s^2 2s^2 2p^6 3s^2 3p^6 4s^1 3d^5"
+    assert summary["estimated_default_spin"] == 6
+    assert resolve_spin(spec) == 6
 
 
 def test_atomic_rhf_for_helium() -> None:
@@ -98,6 +107,13 @@ def test_basis_engineering_detects_general_contraction() -> None:
     assert summary["general_shells"] == 1
     assert summary["total_contracted_radial_functions"] == 2
     assert summary["shell_summaries"][0]["contraction_signature"] == "3->2"
+
+
+def test_small_benchmark_sweep_runs() -> None:
+    summary = run_benchmark_sweep(min_z=1, max_z=3, basis="sto-3g", method="auto", compare_reference=False)
+    assert summary["successful_cases"] == 3
+    assert summary["failed_cases"] == 0
+    assert len(summary["entries"]) == 3
 
 
 def test_quartet_screened_rhf_fock_matches_dense_builder() -> None:

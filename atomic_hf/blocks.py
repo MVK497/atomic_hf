@@ -5,9 +5,9 @@ from dataclasses import dataclass
 import numpy as np
 from pyscf import gto
 from pyscf.lib import param
-from pyscf.scf import atom_hf
+from pyscf.scf import atom_hf, hf
 
-from .atom import angular_momentum_label
+from .atom import AtomicSpec, angular_momentum_label, build_subshell_occupations
 
 
 @dataclass
@@ -62,6 +62,22 @@ class ActiveERIQuartet:
     reduced_radial_shape: tuple[int, int, int, int]
     max_abs: float
     frobenius_norm: float
+    coulomb_ref: "QuartetBlockReference"
+    exchange_ref: "QuartetBlockReference"
+
+
+@dataclass(frozen=True)
+class QuartetBlockReference:
+    key: tuple[tuple[int, int], tuple[int, int]]
+    requested_to_canonical_axes: tuple[int, int, int, int]
+    canonical_to_requested_axes: tuple[int, int, int, int]
+
+
+@dataclass
+class StructuredERIRepository:
+    threshold: float
+    block_map: dict[tuple[tuple[int, int], tuple[int, int]], np.ndarray]
+    active_quartets: list[ActiveERIQuartet]
 
 
 def compute_diis_error(fock: np.ndarray, density: np.ndarray, overlap: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -100,6 +116,7 @@ def blocked_eigensystem(
     mo_coeff_blocks: list[np.ndarray] = []
     mo_energy_blocks: list[np.ndarray] = []
     metadata: list[dict[str, int | str]] = []
+    orbital_start = 0
 
     for l_value in range(param.L_MAX):
         idx = np.where(ao_ang == l_value)[0]
@@ -121,6 +138,7 @@ def blocked_eigensystem(
 
         mo_coeff_blocks.append(coeff_full)
         mo_energy_blocks.append(np.repeat(energies, degeneracy))
+        orbital_stop = orbital_start + idx.size
         metadata.append(
             {
                 "l": l_value,
@@ -128,8 +146,11 @@ def blocked_eigensystem(
                 "degeneracy": degeneracy,
                 "ao_count": int(idx.size),
                 "radial_functions": int(nrad),
+                "orbital_start": orbital_start,
+                "orbital_stop": orbital_stop,
             }
         )
+        orbital_start = orbital_stop
 
     return np.hstack(mo_energy_blocks), np.hstack(mo_coeff_blocks), metadata
 
@@ -144,6 +165,7 @@ def blocked_generalized_eigh(
     mo_coeff_blocks: list[np.ndarray] = []
     mo_energy_blocks: list[np.ndarray] = []
     metadata: list[dict[str, int | str]] = []
+    orbital_start = 0
 
     for l_value in range(param.L_MAX):
         idx = np.where(ao_ang == l_value)[0]
@@ -167,6 +189,7 @@ def blocked_generalized_eigh(
 
         mo_coeff_blocks.append(coeff_full)
         mo_energy_blocks.append(np.repeat(eps, degeneracy))
+        orbital_stop = orbital_start + idx.size
         metadata.append(
             {
                 "l": l_value,
@@ -174,8 +197,11 @@ def blocked_generalized_eigh(
                 "degeneracy": degeneracy,
                 "ao_count": int(idx.size),
                 "radial_functions": int(nrad),
+                "orbital_start": orbital_start,
+                "orbital_stop": orbital_stop,
             }
         )
+        orbital_start = orbital_stop
     return np.hstack(mo_energy_blocks), np.hstack(mo_coeff_blocks), metadata
 
 
@@ -205,25 +231,216 @@ def build_density_from_occupations(coefficients: np.ndarray, mo_occ: np.ndarray)
     return coefficients @ np.diag(mo_occ) @ coefficients.T
 
 
+def build_atomic_reference_density(mol: gto.Mole) -> np.ndarray:
+    return np.array(hf.init_guess_by_atom(mol), copy=True)
+
+
+def build_atomic_mo_occupations_from_spec(spec: AtomicSpec, mol: gto.Mole) -> np.ndarray:
+    symbol = mol.atom_symbol(0)
+    occupations = build_subshell_occupations(symbol, spec.charge)
+    grouped_by_l: dict[int, int] = {}
+    for orbital in occupations:
+        l_value = "spdfghi".index(orbital.l_label)
+        grouped_by_l[l_value] = grouped_by_l.get(l_value, 0) + orbital.occupancy
+
+    mo_occ_blocks: list[np.ndarray] = []
+    for l_value in range(param.L_MAX):
+        degeneracy = 2 * l_value + 1
+        idx = mol._bas[:, gto.ANG_OF] == l_value
+        nrad = int(mol._bas[idx, gto.NCTR_OF].sum())
+        if nrad == 0:
+            continue
+        electrons_l = grouped_by_l.get(l_value, 0)
+        if electrons_l > 2 * degeneracy * nrad:
+            raise ValueError(
+                f"Basis {mol.basis} does not provide enough radial functions for the occupied {angular_momentum_label(l_value)} block."
+            )
+        occ_l = np.zeros(nrad * degeneracy)
+        full_doubly_occupied = electrons_l // 2
+        remainder = electrons_l % 2
+        occ_l[:full_doubly_occupied] = 2.0
+        if remainder:
+            occ_l[full_doubly_occupied] = 1.0
+        mo_occ_blocks.append(occ_l)
+    return np.hstack(mo_occ_blocks)
+
+
+def build_spin_population_by_l(spec: AtomicSpec) -> tuple[dict[int, int], dict[int, int]]:
+    occupations = build_subshell_occupations(spec.symbol, spec.charge)
+    alpha_by_l: dict[int, int] = {}
+    beta_by_l: dict[int, int] = {}
+    for orbital in occupations:
+        l_value = "spdfghi".index(orbital.l_label)
+        degeneracy = orbital.capacity // 2
+        alpha = min(orbital.occupancy, degeneracy)
+        beta = orbital.occupancy - alpha
+        alpha_by_l[l_value] = alpha_by_l.get(l_value, 0) + alpha
+        beta_by_l[l_value] = beta_by_l.get(l_value, 0) + beta
+    return alpha_by_l, beta_by_l
+
+
+def rebalance_spin_population_by_l(
+    alpha_by_l: dict[int, int],
+    beta_by_l: dict[int, int],
+    target_nalpha: int,
+    target_nbeta: int,
+) -> tuple[dict[int, int], dict[int, int]]:
+    alpha = dict(alpha_by_l)
+    beta = dict(beta_by_l)
+    current_nalpha = sum(alpha.values())
+    current_nbeta = sum(beta.values())
+    if current_nalpha == target_nalpha and current_nbeta == target_nbeta:
+        return alpha, beta
+
+    if current_nalpha + current_nbeta != target_nalpha + target_nbeta:
+        raise ValueError("Spin-population rebalance cannot change the total number of electrons.")
+
+    while current_nalpha > target_nalpha:
+        updated = False
+        for l_value in sorted(alpha, reverse=True):
+            if alpha.get(l_value, 0) > 0:
+                alpha[l_value] -= 1
+                beta[l_value] = beta.get(l_value, 0) + 1
+                current_nalpha -= 1
+                current_nbeta += 1
+                updated = True
+                break
+        if not updated:
+            raise ValueError("Unable to lower alpha electron count to the requested spin state.")
+
+    while current_nalpha < target_nalpha:
+        updated = False
+        for l_value in sorted(beta, reverse=True):
+            if beta.get(l_value, 0) > 0:
+                beta[l_value] -= 1
+                alpha[l_value] = alpha.get(l_value, 0) + 1
+                current_nalpha += 1
+                current_nbeta -= 1
+                updated = True
+                break
+        if not updated:
+            raise ValueError("Unable to raise alpha electron count to the requested spin state.")
+
+    return alpha, beta
+
+
+def build_spin_mo_occupations_by_blocks(
+    symmetry_blocks: list[dict[str, int | str]],
+    electrons_by_l: dict[int, int],
+) -> np.ndarray:
+    num_orbitals = 0
+    for block in symmetry_blocks:
+        num_orbitals = max(num_orbitals, int(block["orbital_stop"]))
+    occupations = np.zeros(num_orbitals)
+    for block in symmetry_blocks:
+        start = int(block["orbital_start"])
+        stop = int(block["orbital_stop"])
+        l_value = int(block["l"])
+        count = electrons_by_l.get(l_value, 0)
+        block_size = stop - start
+        if count > block_size:
+            raise ValueError(
+                f"Too many spin-{angular_momentum_label(l_value)} electrons ({count}) for block size {block_size}."
+            )
+        occupations[start : start + count] = 1.0
+    return occupations
+
+
+def build_spin_density_from_block_occupations(
+    coefficients: np.ndarray,
+    symmetry_blocks: list[dict[str, int | str]],
+    electrons_by_l: dict[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    occupations = build_spin_mo_occupations_by_blocks(symmetry_blocks, electrons_by_l)
+    return build_density_from_occupations(coefficients, occupations), occupations
+
+
+def damp_density(
+    previous_density: np.ndarray,
+    new_density: np.ndarray,
+    damping_factor: float,
+) -> np.ndarray:
+    if damping_factor <= 0.0:
+        return np.array(new_density, copy=True)
+    return damping_factor * previous_density + (1.0 - damping_factor) * new_density
+
+
+def apply_level_shift(
+    fock: np.ndarray,
+    overlap: np.ndarray,
+    coefficients: np.ndarray,
+    mo_occ: np.ndarray,
+    level_shift: float,
+) -> np.ndarray:
+    if level_shift <= 0.0:
+        return np.array(fock, copy=True)
+    occupied_mask = mo_occ > 1.0e-12
+    virtual_coeff = coefficients[:, ~occupied_mask]
+    if virtual_coeff.size == 0:
+        return np.array(fock, copy=True)
+    return fock + level_shift * overlap @ virtual_coeff @ virtual_coeff.T @ overlap
+
+
 def build_fock(h_core: np.ndarray, eri: np.ndarray, density: np.ndarray) -> np.ndarray:
     coulomb = np.einsum("ls,mnls->mn", density, eri, optimize=True)
     exchange = np.einsum("ls,mlns->mn", density, eri, optimize=True)
     return h_core + coulomb - 0.5 * exchange
 
 
-def build_active_eri_quartets(
+def _canonicalize_quartet_axes(
+    l1: int,
+    l2: int,
+    l3: int,
+    l4: int,
+) -> QuartetBlockReference:
+    pair_left = ((0, l1), (1, l2))
+    pair_right = ((2, l3), (3, l4))
+
+    if pair_left[0][1] > pair_left[1][1]:
+        pair_left = (pair_left[1], pair_left[0])
+    if pair_right[0][1] > pair_right[1][1]:
+        pair_right = (pair_right[1], pair_right[0])
+    if (pair_left[0][1], pair_left[1][1]) > (pair_right[0][1], pair_right[1][1]):
+        canonical_tokens = pair_right + pair_left
+    else:
+        canonical_tokens = pair_left + pair_right
+
+    requested_to_canonical_axes = tuple(token[0] for token in canonical_tokens)
+    canonical_to_requested_axes = tuple(int(value) for value in np.argsort(requested_to_canonical_axes))
+    canonical_left = (canonical_tokens[0][1], canonical_tokens[1][1])
+    canonical_right = (canonical_tokens[2][1], canonical_tokens[3][1])
+    return QuartetBlockReference(
+        key=(canonical_left, canonical_right),
+        requested_to_canonical_axes=requested_to_canonical_axes,
+        canonical_to_requested_axes=canonical_to_requested_axes,
+    )
+
+
+def _orient_quartet_block(block: np.ndarray, reference: QuartetBlockReference) -> np.ndarray:
+    return np.transpose(block, axes=reference.canonical_to_requested_axes)
+
+
+def _intern_quartet_block(
+    block_map: dict[tuple[tuple[int, int], tuple[int, int]], np.ndarray],
+    reference: QuartetBlockReference,
+    requested_block: np.ndarray,
+) -> QuartetBlockReference:
+    if reference.key not in block_map:
+        block_map[reference.key] = np.transpose(requested_block, axes=reference.requested_to_canonical_axes).copy()
+    return reference
+
+
+def build_structured_eri_repository(
     mol: gto.Mole,
     eri: np.ndarray,
     threshold: float = 1.0e-12,
-) -> list[ActiveERIQuartet]:
+) -> StructuredERIRepository:
     ao_ang = ao_angular_momentum_for_each_ao(mol)
     unique_l = sorted(set(int(value) for value in ao_ang))
     l_indices = {l_value: np.where(ao_ang == l_value)[0] for l_value in unique_l}
-    radial_counts = {
-        l_value: int(l_indices[l_value].size // (2 * l_value + 1))
-        for l_value in unique_l
-    }
+    radial_counts = {l_value: int(l_indices[l_value].size // (2 * l_value + 1)) for l_value in unique_l}
 
+    block_map: dict[tuple[tuple[int, int], tuple[int, int]], np.ndarray] = {}
     active_quartets: list[ActiveERIQuartet] = []
     for l1 in unique_l:
         idx1 = l_indices[l1]
@@ -233,10 +450,21 @@ def build_active_eri_quartets(
                 idx3 = l_indices[l3]
                 for l4 in unique_l:
                     idx4 = l_indices[l4]
-                    block = eri[np.ix_(idx1, idx2, idx3, idx4)]
-                    max_abs = float(np.max(np.abs(block))) if block.size else 0.0
+                    coulomb_block = eri[np.ix_(idx1, idx2, idx3, idx4)]
+                    max_abs = float(np.max(np.abs(coulomb_block))) if coulomb_block.size else 0.0
                     if max_abs <= threshold:
                         continue
+                    exchange_block = eri[np.ix_(idx1, idx3, idx2, idx4)]
+                    coulomb_ref = _intern_quartet_block(
+                        block_map,
+                        _canonicalize_quartet_axes(l1, l2, l3, l4),
+                        coulomb_block,
+                    )
+                    exchange_ref = _intern_quartet_block(
+                        block_map,
+                        _canonicalize_quartet_axes(l1, l3, l2, l4),
+                        exchange_block,
+                    )
                     active_quartets.append(
                         ActiveERIQuartet(
                             l_values=(l1, l2, l3, l4),
@@ -258,34 +486,67 @@ def build_active_eri_quartets(
                                 radial_counts[l4],
                             ),
                             max_abs=max_abs,
-                            frobenius_norm=float(np.linalg.norm(block)),
+                            frobenius_norm=float(np.linalg.norm(coulomb_block)),
+                            coulomb_ref=coulomb_ref,
+                            exchange_ref=exchange_ref,
                         )
                     )
-    return active_quartets
+    return StructuredERIRepository(
+        threshold=threshold,
+        block_map=block_map,
+        active_quartets=active_quartets,
+    )
+
+
+def build_active_eri_quartets(
+    mol: gto.Mole,
+    eri: np.ndarray,
+    threshold: float = 1.0e-12,
+) -> list[ActiveERIQuartet]:
+    return build_structured_eri_repository(mol, eri, threshold=threshold).active_quartets
 
 
 def build_fock_from_active_quartets(
     h_core: np.ndarray,
-    eri: np.ndarray,
-    density: np.ndarray,
-    active_quartets: list[ActiveERIQuartet],
+    density_or_eri: np.ndarray,
+    structured_eri_or_density: StructuredERIRepository | np.ndarray,
+    active_quartets: list[ActiveERIQuartet] | None = None,
 ) -> np.ndarray:
+    if active_quartets is None:
+        density = density_or_eri
+        structured_eri = structured_eri_or_density
+        eri = None
+    else:
+        eri = density_or_eri
+        density = structured_eri_or_density
+        structured_eri = None
+
     fock = np.array(h_core, copy=True)
-    for quartet in active_quartets:
+    quartet_iterable = structured_eri.active_quartets if structured_eri is not None else active_quartets
+    for quartet in quartet_iterable:
+        if structured_eri is not None:
+            coulomb_block = _orient_quartet_block(structured_eri.block_map[quartet.coulomb_ref.key], quartet.coulomb_ref)
+            exchange_block = _orient_quartet_block(
+                structured_eri.block_map[quartet.exchange_ref.key],
+                quartet.exchange_ref,
+            )
+        else:
+            coulomb_block = eri[np.ix_(quartet.idx_p, quartet.idx_q, quartet.idx_r, quartet.idx_s)]
+            exchange_block = eri[np.ix_(quartet.idx_p, quartet.idx_r, quartet.idx_q, quartet.idx_s)]
         density_rs = density[np.ix_(quartet.idx_r, quartet.idx_s)]
-        coulomb_block = np.einsum(
+        coulomb_contrib = np.einsum(
             "rs,pqrs->pq",
             density_rs,
-            eri[np.ix_(quartet.idx_p, quartet.idx_q, quartet.idx_r, quartet.idx_s)],
+            coulomb_block,
             optimize=True,
         )
-        exchange_block = np.einsum(
+        exchange_contrib = np.einsum(
             "rs,prqs->pq",
             density_rs,
-            eri[np.ix_(quartet.idx_p, quartet.idx_r, quartet.idx_q, quartet.idx_s)],
+            exchange_block,
             optimize=True,
         )
-        fock[np.ix_(quartet.idx_p, quartet.idx_q)] += coulomb_block - 0.5 * exchange_block
+        fock[np.ix_(quartet.idx_p, quartet.idx_q)] += coulomb_contrib - 0.5 * exchange_contrib
     return fock
 
 
@@ -304,19 +565,37 @@ def build_uhf_fock(
 
 def build_uhf_fock_from_active_quartets(
     h_core: np.ndarray,
-    eri: np.ndarray,
-    density_alpha: np.ndarray,
-    density_beta: np.ndarray,
-    active_quartets: list[ActiveERIQuartet],
+    density_alpha_or_eri: np.ndarray,
+    density_beta_or_alpha: np.ndarray,
+    structured_eri_or_beta: StructuredERIRepository | np.ndarray,
+    active_quartets: list[ActiveERIQuartet] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if active_quartets is None:
+        density_alpha = density_alpha_or_eri
+        density_beta = density_beta_or_alpha
+        structured_eri = structured_eri_or_beta
+        eri = None
+    else:
+        eri = density_alpha_or_eri
+        density_alpha = density_beta_or_alpha
+        density_beta = structured_eri_or_beta
+        structured_eri = None
+
     fock_alpha = np.array(h_core, copy=True)
     fock_beta = np.array(h_core, copy=True)
     density_total = density_alpha + density_beta
 
-    for quartet in active_quartets:
-        eri_coulomb = eri[np.ix_(quartet.idx_p, quartet.idx_q, quartet.idx_r, quartet.idx_s)]
-        eri_exchange = eri[np.ix_(quartet.idx_p, quartet.idx_r, quartet.idx_q, quartet.idx_s)]
-
+    quartet_iterable = structured_eri.active_quartets if structured_eri is not None else active_quartets
+    for quartet in quartet_iterable:
+        if structured_eri is not None:
+            eri_coulomb = _orient_quartet_block(structured_eri.block_map[quartet.coulomb_ref.key], quartet.coulomb_ref)
+            eri_exchange = _orient_quartet_block(
+                structured_eri.block_map[quartet.exchange_ref.key],
+                quartet.exchange_ref,
+            )
+        else:
+            eri_coulomb = eri[np.ix_(quartet.idx_p, quartet.idx_q, quartet.idx_r, quartet.idx_s)]
+            eri_exchange = eri[np.ix_(quartet.idx_p, quartet.idx_r, quartet.idx_q, quartet.idx_s)]
         density_total_rs = density_total[np.ix_(quartet.idx_r, quartet.idx_s)]
         density_alpha_rs = density_alpha[np.ix_(quartet.idx_r, quartet.idx_s)]
         density_beta_rs = density_beta[np.ix_(quartet.idx_r, quartet.idx_s)]
@@ -367,9 +646,17 @@ def compute_uhf_s2(
     coeff_beta: np.ndarray,
     nalpha: int,
     nbeta: int,
+    mo_occ_alpha: np.ndarray | None = None,
+    mo_occ_beta: np.ndarray | None = None,
 ) -> tuple[float, float, float]:
-    occ_alpha = coeff_alpha[:, :nalpha]
-    occ_beta = coeff_beta[:, :nbeta]
+    if mo_occ_alpha is None:
+        occ_alpha = coeff_alpha[:, :nalpha]
+    else:
+        occ_alpha = coeff_alpha[:, mo_occ_alpha > 1.0e-12]
+    if mo_occ_beta is None:
+        occ_beta = coeff_beta[:, :nbeta]
+    else:
+        occ_beta = coeff_beta[:, mo_occ_beta > 1.0e-12]
     if nalpha == 0 or nbeta == 0:
         overlap_occ = 0.0
     else:
@@ -426,8 +713,8 @@ def analyze_two_electron_integrals(
     eri: np.ndarray,
     threshold: float = 1.0e-12,
 ) -> dict[str, object]:
-    active_quartets = build_active_eri_quartets(mol, eri, threshold=threshold)
-    active_quartet_map = {quartet.l_values: quartet for quartet in active_quartets}
+    structured_eri = build_structured_eri_repository(mol, eri, threshold=threshold)
+    active_quartet_map = {quartet.l_values: quartet for quartet in structured_eri.active_quartets}
 
     ao_ang = ao_angular_momentum_for_each_ao(mol)
     unique_l = sorted(set(int(value) for value in ao_ang))
@@ -488,6 +775,7 @@ def analyze_two_electron_integrals(
         "active_angular_quartets": active_count,
         "inactive_angular_quartets": len(quartet_summaries) - active_count,
         "active_ratio": float(active_count / len(quartet_summaries)) if quartet_summaries else 0.0,
+        "unique_canonical_blocks": len(structured_eri.block_map),
         "dominant_active_quartets": active_sorted[:12],
         "quartet_summaries": quartet_summaries,
     }

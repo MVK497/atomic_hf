@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--spin",
         type=int,
         default=None,
-        help="2S = N(alpha) - N(beta). Required for UHF. Optional for RHF closed-shell atoms.",
+        help="2S = N(alpha) - N(beta). Optional; if omitted, an atomic high-spin default is inferred.",
     )
     parser.add_argument(
         "--method",
@@ -31,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--energy-tol", type=float, default=1.0e-10, help="SCF energy tolerance.")
     parser.add_argument("--no-diis", action="store_true", help="Disable DIIS.")
     parser.add_argument("--diis-space", type=int, default=6, help="Number of DIIS vectors.")
+    parser.add_argument("--diis-start", type=int, default=None, help="Iteration to start DIIS extrapolation.")
+    parser.add_argument("--guess", type=str, default="atom", choices=["atom", "core"], help="Initial guess strategy.")
+    parser.add_argument("--damping", type=float, default=0.2, help="Density damping factor used in early cycles.")
+    parser.add_argument("--damping-cycles", type=int, default=None, help="Number of early iterations to damp.")
+    parser.add_argument("--level-shift", type=float, default=0.5, help="Virtual-space level shift in Hartree.")
     parser.add_argument("--show-history", action="store_true", help="Print SCF energy history.")
     return parser
 
@@ -42,6 +47,7 @@ def print_configuration_summary(summary: dict[str, object]) -> None:
     print(f"Electrons: {summary['electrons']}")
     print(f"Charge: {summary['charge']}")
     print(f"Estimated Aufbau configuration: {summary['estimated_configuration']}")
+    print(f"Reference angular-shell profile: {summary['reference_l_shell_configuration']}")
     print(f"Estimated unpaired electrons: {summary['estimated_unpaired_electrons']}")
 
 
@@ -101,6 +107,7 @@ def print_two_electron_integral_summary(summary: dict[str, object]) -> None:
     print(f"  Active angular quartets: {summary['active_angular_quartets']}")
     print(f"  Inactive angular quartets: {summary['inactive_angular_quartets']}")
     print(f"  Active ratio: {summary['active_ratio']:.3f}")
+    print(f"  Unique canonical quartet blocks: {summary['unique_canonical_blocks']}")
     print("  Dominant active quartets:")
     for quartet in summary["dominant_active_quartets"]:
         labels = ",".join(quartet["labels"])
@@ -148,8 +155,22 @@ def print_rhf_result(result: AtomicRHFResult, show_history: bool) -> None:
     print(f"Basis: {result.basis}")
     print(f"Spin (2S): {result.spin}")
     print(f"Spherical-average atomic solver: {result.spherical_average}")
+    print(f"Initial guess: {result.initial_guess}")
     print(f"SCF iterations: {result.iterations}")
     print(f"Total energy: {result.energy:.12f} Eh")
+    print(
+        "Stabilization: "
+        f"DIIS={result.stabilization_summary['use_diis']}, "
+        f"diis_start={result.stabilization_summary['diis_start_cycle']}, "
+        f"damping={result.stabilization_summary['damping_factor']}, "
+        f"level_shift={result.stabilization_summary['level_shift']}"
+    )
+    print(
+        "Fock builder: "
+        f"{result.fock_build_summary['builder']} "
+        f"(active quartets={result.fock_build_summary['active_angular_quartets']}, "
+        f"unique blocks={result.fock_build_summary['unique_canonical_blocks']})"
+    )
     print()
     print("MO occupations / energies")
     for index, (occ, energy) in enumerate(zip(result.mo_occupations, result.orbital_energies, strict=True), start=1):
@@ -174,10 +195,24 @@ def print_uhf_result(result: AtomicUHFResult, show_history: bool) -> None:
     print(f"Basis: {result.basis}")
     print(f"Spin (2S): {result.spin}")
     print("Blocked atomic solver: True")
+    print(f"Initial guess: {result.initial_guess}")
     print(f"Alpha electrons: {result.nalpha}")
     print(f"Beta electrons: {result.nbeta}")
     print(f"SCF iterations: {result.iterations}")
     print(f"Total energy: {result.energy:.12f} Eh")
+    print(
+        "Stabilization: "
+        f"DIIS={result.stabilization_summary['use_diis']}, "
+        f"diis_start={result.stabilization_summary['diis_start_cycle']}, "
+        f"damping={result.stabilization_summary['damping_factor']}, "
+        f"level_shift={result.stabilization_summary['level_shift']}"
+    )
+    print(
+        "Fock builder: "
+        f"{result.fock_build_summary['builder']} "
+        f"(active quartets={result.fock_build_summary['active_angular_quartets']}, "
+        f"unique blocks={result.fock_build_summary['unique_canonical_blocks']})"
+    )
     print(f"<S^2>: {result.s2:.12f}")
     print(f"Expected <S^2>: {result.expected_s2:.12f}")
     print(f"Spin contamination: {result.spin_contamination:.12f}")
@@ -227,9 +262,6 @@ def main() -> None:
     print_configuration_summary(configuration_summary)
     resolved_spin = resolve_spin(spec)
     print(f"Resolved spin (2S): {resolved_spin}")
-    if args.spin is None and args.method == "uhf":
-        print("Spin was not provided explicitly; UHF requires a deliberate state choice, so this run will stop.")
-
     if args.method == "rhf":
         result = run_atomic_rhf(
             spec,
@@ -237,6 +269,11 @@ def main() -> None:
             e_tol=args.energy_tol,
             use_diis=not args.no_diis,
             diis_space=args.diis_space,
+            initial_guess=args.guess,
+            damping_factor=args.damping,
+            damping_cycles=args.damping_cycles if args.damping_cycles is not None else 4,
+            level_shift=args.level_shift,
+            diis_start_cycle=args.diis_start if args.diis_start is not None else 2,
         )
         print_rhf_result(result, args.show_history)
         return
@@ -247,5 +284,10 @@ def main() -> None:
         e_tol=args.energy_tol,
         use_diis=not args.no_diis,
         diis_space=args.diis_space,
+        initial_guess=args.guess,
+        damping_factor=args.damping,
+        damping_cycles=args.damping_cycles if args.damping_cycles is not None else 6,
+        level_shift=args.level_shift,
+        diis_start_cycle=args.diis_start if args.diis_start is not None else 3,
     )
     print_uhf_result(result, args.show_history)

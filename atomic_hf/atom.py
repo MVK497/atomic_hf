@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pyscf import gto
+from pyscf.data import elements
 
 
 ANGULAR_LABELS = "spdfghi"
+ANGULAR_LABEL_TO_VALUE = {label: index for index, label in enumerate(ANGULAR_LABELS)}
 AUFBAU_ORDER: list[tuple[int, str, int]] = [
     (1, "s", 2),
     (2, "s", 2),
@@ -72,28 +74,137 @@ def electron_count(symbol: str, charge: int = 0) -> int:
     return nelec
 
 
-def build_subshell_occupations(symbol: str, charge: int = 0) -> list[SubshellOccupation]:
-    remaining = electron_count(symbol, charge)
+def _subshell_unpaired_electrons(occupancy: int, capacity: int) -> int:
+    degeneracy = capacity // 2
+    return occupancy if occupancy <= degeneracy else capacity - occupancy
+
+
+def _build_aufbau_subshell_occupations_for_electron_count(nelec: int) -> list[SubshellOccupation]:
+    remaining = nelec
     occupations: list[SubshellOccupation] = []
     for n, l_label, capacity in AUFBAU_ORDER:
         if remaining <= 0:
             break
         occ = min(remaining, capacity)
-        degeneracy = capacity // 2
-        unpaired = occ if occ <= degeneracy else capacity - occ
         occupations.append(
             SubshellOccupation(
                 n=n,
                 l_label=l_label,
                 occupancy=occ,
                 capacity=capacity,
-                unpaired=unpaired,
+                unpaired=_subshell_unpaired_electrons(occ, capacity),
             )
         )
         remaining -= occ
     if remaining != 0:
         raise ValueError("Electron configuration exceeded the supported Aufbau table.")
     return occupations
+
+
+def _aggregate_subshell_occupations_by_l(occupations: list[SubshellOccupation]) -> dict[str, int]:
+    totals = {label: 0 for label in ANGULAR_LABELS[:4]}
+    for orbital in occupations:
+        if orbital.l_label in totals:
+            totals[orbital.l_label] += orbital.occupancy
+    return totals
+
+
+def _reference_angular_occupations(nelec: int) -> dict[str, int]:
+    if nelec >= len(elements.CONFIGURATION):
+        raise ValueError(f"No PySCF atomic configuration table is available for {nelec} electrons.")
+    reference = elements.CONFIGURATION[nelec]
+    return {
+        ANGULAR_LABELS[l_value]: int(reference[l_value])
+        for l_value in range(min(4, len(reference)))
+    }
+
+
+def _reconcile_occupations_with_reference_l_totals(
+    occupations: list[SubshellOccupation],
+    nelec: int,
+) -> list[SubshellOccupation]:
+    mutable = [
+        {
+            "n": orbital.n,
+            "l_label": orbital.l_label,
+            "occupancy": orbital.occupancy,
+            "capacity": orbital.capacity,
+        }
+        for orbital in occupations
+    ]
+    target = _reference_angular_occupations(nelec)
+
+    def current_totals() -> dict[str, int]:
+        totals = {label: 0 for label in target}
+        for orbital in mutable:
+            l_label = orbital["l_label"]
+            if l_label in totals:
+                totals[l_label] += int(orbital["occupancy"])
+        return totals
+
+    for _ in range(64):
+        totals = current_totals()
+        if totals == target:
+            break
+
+        deficits = {label: target[label] - totals[label] for label in target if target[label] > totals[label]}
+        surpluses = {label: totals[label] - target[label] for label in target if totals[label] > target[label]}
+        if not deficits and not surpluses:
+            break
+        if not deficits or not surpluses:
+            break
+
+        donor_index = next(
+            (
+                index
+                for index in range(len(mutable) - 1, -1, -1)
+                if mutable[index]["l_label"] in surpluses and mutable[index]["occupancy"] > 0
+            ),
+            None,
+        )
+        acceptor_index = next(
+            (
+                index
+                for index, orbital in enumerate(mutable)
+                if orbital["l_label"] in deficits and orbital["occupancy"] < orbital["capacity"]
+            ),
+            None,
+        )
+        if donor_index is None or acceptor_index is None:
+            break
+
+        donor = mutable[donor_index]
+        acceptor = mutable[acceptor_index]
+        move = min(
+            surpluses[donor["l_label"]],
+            deficits[acceptor["l_label"]],
+            int(donor["occupancy"]),
+            int(acceptor["capacity"] - acceptor["occupancy"]),
+        )
+        if move <= 0:
+            break
+
+        donor["occupancy"] -= move
+        acceptor["occupancy"] += move
+
+    reconciled = [
+        SubshellOccupation(
+            n=int(orbital["n"]),
+            l_label=str(orbital["l_label"]),
+            occupancy=int(orbital["occupancy"]),
+            capacity=int(orbital["capacity"]),
+            unpaired=_subshell_unpaired_electrons(int(orbital["occupancy"]), int(orbital["capacity"])),
+        )
+        for orbital in mutable
+        if int(orbital["occupancy"]) > 0
+    ]
+    return reconciled
+
+
+def build_subshell_occupations(symbol: str, charge: int = 0) -> list[SubshellOccupation]:
+    nelec = electron_count(symbol, charge)
+    occupations = _build_aufbau_subshell_occupations_for_electron_count(nelec)
+    return _reconcile_occupations_with_reference_l_totals(occupations, nelec)
 
 
 def resolve_spin(spec: AtomicSpec) -> int:
@@ -108,12 +219,17 @@ def build_configuration_summary(spec: AtomicSpec) -> dict[str, object]:
     occupations = build_subshell_occupations(symbol, spec.charge)
     configuration = " ".join(f"{orbital.label}^{orbital.occupancy}" for orbital in occupations)
     unpaired = sum(orbital.unpaired for orbital in occupations)
+    l_totals = _aggregate_subshell_occupations_by_l(occupations)
+    reference_l_configuration = " ".join(
+        f"{label}^{count}" for label, count in l_totals.items() if count > 0
+    )
     return {
         "symbol": symbol,
         "atomic_number": atomic_number(symbol),
         "electrons": electron_count(symbol, spec.charge),
         "charge": spec.charge,
         "estimated_configuration": configuration,
+        "reference_l_shell_configuration": reference_l_configuration,
         "estimated_unpaired_electrons": unpaired,
         "estimated_default_spin": unpaired,
         "subshell_occupations": occupations,

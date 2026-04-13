@@ -15,12 +15,15 @@ from .atom import (
 )
 from .blocks import (
     DIISHelper,
+    apply_level_shift,
     analyze_one_center_integrals,
     analyze_two_electron_integrals,
     blocked_generalized_eigh,
-    build_atomic_mo_occupations,
+    build_atomic_mo_occupations_from_spec,
+    build_atomic_reference_density,
     build_density_from_occupations,
-    build_active_eri_quartets,
+    build_structured_eri_repository,
+    damp_density,
     build_fock_from_active_quartets,
     compute_diis_error,
 )
@@ -47,6 +50,9 @@ class AtomicRHFResult:
     one_center_integral_summary: dict[str, object]
     two_electron_integral_summary: dict[str, object]
     spherical_average: bool
+    initial_guess: str
+    stabilization_summary: dict[str, object]
+    fock_build_summary: dict[str, object]
 
 
 def run_atomic_rhf(
@@ -56,6 +62,11 @@ def run_atomic_rhf(
     d_tol: float = 1.0e-8,
     use_diis: bool = True,
     diis_space: int = 6,
+    initial_guess: str = "atom",
+    damping_factor: float = 0.2,
+    damping_cycles: int = 4,
+    level_shift: float = 0.5,
+    diis_start_cycle: int = 2,
 ) -> AtomicRHFResult:
     spin = resolve_spin(spec)
     if spin != 0:
@@ -71,31 +82,40 @@ def run_atomic_rhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
-    active_quartets = build_active_eri_quartets(mol, eri)
+    structured_eri = build_structured_eri_repository(mol, eri)
 
-    mo_occ = build_atomic_mo_occupations(mol)
+    mo_occ = build_atomic_mo_occupations_from_spec(spec, mol)
     history: list[float] = []
     diis_helper = DIISHelper(max_vectors=diis_space)
 
     orbital_energies, coefficients, symmetry_blocks = blocked_generalized_eigh(h_core, s, mol)
-    density = build_density_from_occupations(coefficients, mo_occ)
+    if initial_guess == "atom":
+        density = build_atomic_reference_density(mol)
+    elif initial_guess == "core":
+        density = build_density_from_occupations(coefficients, mo_occ)
+    else:
+        raise ValueError("RHF initial_guess must be 'atom' or 'core'.")
+    density = 0.5 * (density + density.T)
     previous_energy: float | None = None
 
     overlap_eigvals, overlap_eigvecs = np.linalg.eigh(s)
     x = overlap_eigvecs @ np.diag(overlap_eigvals ** -0.5) @ overlap_eigvecs.T
 
     for iteration in range(1, max_iter + 1):
-        fock = build_fock_from_active_quartets(h_core, eri, density, active_quartets)
-        if use_diis:
+        fock = build_fock_from_active_quartets(h_core, density, structured_eri)
+        if use_diis and iteration >= diis_start_cycle:
             diis_error = compute_diis_error(fock, density, s, x)
             diis_helper.push(fock, diis_error)
             fock_to_diagonalize = diis_helper.extrapolate()
         else:
             fock_to_diagonalize = fock
+        fock_to_diagonalize = apply_level_shift(fock_to_diagonalize, s, coefficients, mo_occ, level_shift)
 
         orbital_energies, coefficients, symmetry_blocks = blocked_generalized_eigh(fock_to_diagonalize, s, mol)
         new_density = build_density_from_occupations(coefficients, mo_occ)
-        new_fock = build_fock_from_active_quartets(h_core, eri, new_density, active_quartets)
+        if damping_factor > 0.0 and iteration <= damping_cycles:
+            new_density = damp_density(density, new_density, damping_factor)
+        new_fock = build_fock_from_active_quartets(h_core, new_density, structured_eri)
         electronic_energy = 0.5 * float(np.sum(new_density * (h_core + new_fock)))
         total_energy = electronic_energy + e_nuc
         history.append(total_energy)
@@ -124,6 +144,20 @@ def run_atomic_rhf(
                 one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core),
                 two_electron_integral_summary=analyze_two_electron_integrals(mol, eri),
                 spherical_average=True,
+                initial_guess=initial_guess,
+                stabilization_summary={
+                    "use_diis": use_diis,
+                    "diis_space": diis_space,
+                    "diis_start_cycle": diis_start_cycle,
+                    "damping_factor": damping_factor,
+                    "damping_cycles": damping_cycles,
+                    "level_shift": level_shift,
+                },
+                fock_build_summary={
+                    "builder": "structured_one_center_quartets",
+                    "active_angular_quartets": len(structured_eri.active_quartets),
+                    "unique_canonical_blocks": len(structured_eri.block_map),
+                },
             )
 
         density = new_density
