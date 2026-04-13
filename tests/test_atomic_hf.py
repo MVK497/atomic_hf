@@ -19,6 +19,8 @@ from atomic_hf.blocks import (
     build_active_eri_quartets,
     build_fock,
     build_fock_from_active_quartets,
+    build_reduced_radial_eri_repository,
+    build_rhf_fock_from_reduced_radial_eri,
     build_uhf_fock,
     build_uhf_fock_from_active_quartets,
 )
@@ -136,6 +138,19 @@ def test_quartet_screened_rhf_fock_matches_dense_builder() -> None:
     screened_fock = build_fock_from_active_quartets(h_core, eri, density, active_quartets)
 
     assert np.allclose(screened_fock, dense_fock, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_reduced_radial_rhf_fock_matches_dense_builder_for_spherical_density() -> None:
+    result = run_atomic_rhf(AtomicSpec(symbol="Ne", basis="sto-3g", spin=0))
+    mol = build_atomic_molecule(AtomicSpec(symbol="Ne", basis="sto-3g", spin=0))
+    h_core = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+    eri = mol.intor("int2e")
+    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
+
+    dense_fock = build_fock(h_core, eri, result.density)
+    reduced_fock = build_rhf_fock_from_reduced_radial_eri(h_core, result.density, mol, reduced_radial_eri)
+
+    assert np.allclose(reduced_fock, dense_fock, atol=1.0e-12, rtol=1.0e-12)
 
 
 def test_quartet_screened_uhf_fock_matches_dense_builder() -> None:

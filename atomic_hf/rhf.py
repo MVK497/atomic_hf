@@ -22,9 +22,9 @@ from .blocks import (
     build_atomic_mo_occupations_from_spec,
     build_atomic_reference_density,
     build_density_from_occupations,
-    build_structured_eri_repository,
+    build_reduced_radial_eri_repository,
     damp_density,
-    build_fock_from_active_quartets,
+    build_rhf_fock_from_reduced_radial_eri,
     compute_diis_error,
 )
 
@@ -82,7 +82,7 @@ def run_atomic_rhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
-    structured_eri = build_structured_eri_repository(mol, eri)
+    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
 
     mo_occ = build_atomic_mo_occupations_from_spec(spec, mol)
     history: list[float] = []
@@ -102,7 +102,7 @@ def run_atomic_rhf(
     x = overlap_eigvecs @ np.diag(overlap_eigvals ** -0.5) @ overlap_eigvecs.T
 
     for iteration in range(1, max_iter + 1):
-        fock = build_fock_from_active_quartets(h_core, density, structured_eri)
+        fock = build_rhf_fock_from_reduced_radial_eri(h_core, density, mol, reduced_radial_eri)
         if use_diis and iteration >= diis_start_cycle:
             diis_error = compute_diis_error(fock, density, s, x)
             diis_helper.push(fock, diis_error)
@@ -115,7 +115,7 @@ def run_atomic_rhf(
         new_density = build_density_from_occupations(coefficients, mo_occ)
         if damping_factor > 0.0 and iteration <= damping_cycles:
             new_density = damp_density(density, new_density, damping_factor)
-        new_fock = build_fock_from_active_quartets(h_core, new_density, structured_eri)
+        new_fock = build_rhf_fock_from_reduced_radial_eri(h_core, new_density, mol, reduced_radial_eri)
         electronic_energy = 0.5 * float(np.sum(new_density * (h_core + new_fock)))
         total_energy = electronic_energy + e_nuc
         history.append(total_energy)
@@ -154,9 +154,8 @@ def run_atomic_rhf(
                     "level_shift": level_shift,
                 },
                 fock_build_summary={
-                    "builder": "structured_one_center_quartets",
-                    "active_angular_quartets": len(structured_eri.active_quartets),
-                    "unique_canonical_blocks": len(structured_eri.block_map),
+                    "builder": "reduced_radial_pair_blocks",
+                    "active_reduced_radial_pair_blocks": len(reduced_radial_eri.pair_blocks),
                 },
             )
 

@@ -17,6 +17,7 @@ The code focuses on single-center atoms and ions rather than general molecules. 
 - Blocked `UHF` diagonalization for separate alpha/beta channels
 - One-center one-electron integral reduction analysis
 - Structured one-center ERI quartet repository with canonical-block reuse
+- Exact reduced-radial RHF Fock construction for spherically averaged closed-shell atoms
 - Quartet-screened `RHF` / `UHF` Fock construction
 - Basis engineering analysis:
   - segmented vs general contraction detection
@@ -108,6 +109,7 @@ For each run, the program reports:
 - angular-momentum block structure used in the solver
 - one-center one-electron reduction statistics
 - dominant one-center two-electron integral quartets
+- dominant reduced-radial pair blocks for the one-center ERI tensor
 - active quartet count and unique canonical quartet-block count
 
 ## Tests
@@ -121,7 +123,7 @@ pytest
 
 - `RHF` is limited to closed-shell atoms and ions
 - Heavy atoms may require a larger or relativistic basis; benchmark mode can fall back automatically, but ordinary CLI runs still use the basis you request
-- The one-center ERI acceleration currently reuses canonical quartet blocks and skips inactive quartets, but it does not yet implement a fully radial/Gaunt-factor atomic ERI formulation
+- The one-center ERI acceleration now includes an exact reduced-radial RHF builder plus canonical quartet reuse, but it does not yet implement a fully Gaunt/Wigner-factorized atomic ERI formulation
 - General-contraction structure is analyzed, but contraction-aware integral/Fock acceleration is still incomplete
 - The project does not yet include relativistic Hamiltonians, ECP-aware workflows, or production-grade occupation control for every exotic ion/state
 - A full `Z = 1 .. 102` production benchmark is still a workload for the benchmark tool, not a completed published data set inside the repository

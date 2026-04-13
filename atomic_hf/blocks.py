@@ -80,6 +80,28 @@ class StructuredERIRepository:
     active_quartets: list[ActiveERIQuartet]
 
 
+@dataclass(frozen=True)
+class ReducedRadialPairBlock:
+    l_output: int
+    l_density: int
+    output_label: str
+    density_label: str
+    output_radial_functions: int
+    density_radial_functions: int
+    coulomb_tensor: np.ndarray
+    exchange_tensor: np.ndarray
+    coulomb_max_abs: float
+    exchange_max_abs: float
+    coulomb_frobenius_norm: float
+    exchange_frobenius_norm: float
+
+
+@dataclass
+class ReducedRadialERIRepository:
+    threshold: float
+    pair_blocks: dict[tuple[int, int], ReducedRadialPairBlock]
+
+
 def compute_diis_error(fock: np.ndarray, density: np.ndarray, overlap: np.ndarray, x: np.ndarray) -> np.ndarray:
     commutator = fock @ density @ overlap - overlap @ density @ fock
     return x.T @ commutator @ x
@@ -104,6 +126,35 @@ def reduced_matrix_for_l(matrix: np.ndarray, mol: gto.Mole, l_value: int) -> tup
     block = matrix[idx[:, None], idx].reshape(nrad, degeneracy, nrad, degeneracy)
     reduced = np.einsum("piqi->pq", block) / degeneracy
     return reduced, idx
+
+
+def expand_reduced_matrix_for_l(
+    reduced_matrix: np.ndarray,
+    mol: gto.Mole,
+    l_value: int,
+) -> np.ndarray:
+    ao_ang = ao_angular_momentum_for_each_ao(mol)
+    idx = np.where(ao_ang == l_value)[0]
+    full = np.zeros((mol.nao_nr(), mol.nao_nr()))
+    if idx.size == 0:
+        return full
+    degeneracy = 2 * l_value + 1
+    block = np.zeros((idx.size, idx.size))
+    for m_index in range(degeneracy):
+        block[m_index::degeneracy, m_index::degeneracy] = reduced_matrix
+    full[np.ix_(idx, idx)] = block
+    return full
+
+
+def build_reduced_density_by_l(
+    density: np.ndarray,
+    mol: gto.Mole,
+) -> dict[int, np.ndarray]:
+    ao_ang = ao_angular_momentum_for_each_ao(mol)
+    reduced_density: dict[int, np.ndarray] = {}
+    for l_value in sorted(set(int(value) for value in ao_ang)):
+        reduced_density[l_value], _ = reduced_matrix_for_l(density, mol, l_value)
+    return reduced_density
 
 
 def blocked_eigensystem(
@@ -498,12 +549,114 @@ def build_structured_eri_repository(
     )
 
 
+def build_reduced_radial_eri_repository(
+    mol: gto.Mole,
+    eri: np.ndarray,
+    threshold: float = 1.0e-12,
+) -> ReducedRadialERIRepository:
+    ao_ang = ao_angular_momentum_for_each_ao(mol)
+    unique_l = sorted(set(int(value) for value in ao_ang))
+    l_indices = {l_value: np.where(ao_ang == l_value)[0] for l_value in unique_l}
+
+    pair_blocks: dict[tuple[int, int], ReducedRadialPairBlock] = {}
+    for l_output in unique_l:
+        idx_out = l_indices[l_output]
+        degeneracy_out = 2 * l_output + 1
+        nrad_out = idx_out.size // degeneracy_out
+        for l_density in unique_l:
+            idx_den = l_indices[l_density]
+            degeneracy_den = 2 * l_density + 1
+            nrad_den = idx_den.size // degeneracy_den
+
+            coulomb_block = eri[np.ix_(idx_out, idx_out, idx_den, idx_den)].reshape(
+                nrad_out,
+                degeneracy_out,
+                nrad_out,
+                degeneracy_out,
+                nrad_den,
+                degeneracy_den,
+                nrad_den,
+                degeneracy_den,
+            )
+            exchange_block = eri[np.ix_(idx_out, idx_den, idx_out, idx_den)].reshape(
+                nrad_out,
+                degeneracy_out,
+                nrad_den,
+                degeneracy_den,
+                nrad_out,
+                degeneracy_out,
+                nrad_den,
+                degeneracy_den,
+            )
+
+            reduced_coulomb = np.einsum("aibicjdj->abcd", coulomb_block, optimize=True) / degeneracy_out
+            reduced_exchange = np.einsum("aicjbidj->abcd", exchange_block, optimize=True) / degeneracy_out
+
+            coulomb_max_abs = float(np.max(np.abs(reduced_coulomb))) if reduced_coulomb.size else 0.0
+            exchange_max_abs = float(np.max(np.abs(reduced_exchange))) if reduced_exchange.size else 0.0
+            if max(coulomb_max_abs, exchange_max_abs) <= threshold:
+                continue
+
+            pair_blocks[(l_output, l_density)] = ReducedRadialPairBlock(
+                l_output=l_output,
+                l_density=l_density,
+                output_label=angular_momentum_label(l_output),
+                density_label=angular_momentum_label(l_density),
+                output_radial_functions=int(nrad_out),
+                density_radial_functions=int(nrad_den),
+                coulomb_tensor=reduced_coulomb,
+                exchange_tensor=reduced_exchange,
+                coulomb_max_abs=coulomb_max_abs,
+                exchange_max_abs=exchange_max_abs,
+                coulomb_frobenius_norm=float(np.linalg.norm(reduced_coulomb)),
+                exchange_frobenius_norm=float(np.linalg.norm(reduced_exchange)),
+            )
+
+    return ReducedRadialERIRepository(threshold=threshold, pair_blocks=pair_blocks)
+
+
 def build_active_eri_quartets(
     mol: gto.Mole,
     eri: np.ndarray,
     threshold: float = 1.0e-12,
 ) -> list[ActiveERIQuartet]:
     return build_structured_eri_repository(mol, eri, threshold=threshold).active_quartets
+
+
+def build_rhf_fock_from_reduced_radial_eri(
+    h_core: np.ndarray,
+    density: np.ndarray,
+    mol: gto.Mole,
+    reduced_eri: ReducedRadialERIRepository,
+) -> np.ndarray:
+    reduced_density = build_reduced_density_by_l(density, mol)
+    reduced_hcore = {
+        l_value: reduced_matrix_for_l(h_core, mol, l_value)[0]
+        for l_value in reduced_density
+    }
+    reduced_fock = {l_value: np.array(reduced_hcore[l_value], copy=True) for l_value in reduced_density}
+
+    for (l_output, l_density), pair_block in reduced_eri.pair_blocks.items():
+        density_block = reduced_density.get(l_density)
+        if density_block is None or density_block.size == 0:
+            continue
+        reduced_fock[l_output] += np.einsum(
+            "rs,pqrs->pq",
+            density_block,
+            pair_block.coulomb_tensor,
+            optimize=True,
+        )
+        reduced_fock[l_output] -= 0.5 * np.einsum(
+            "rs,pqrs->pq",
+            density_block,
+            pair_block.exchange_tensor,
+            optimize=True,
+        )
+
+    fock = np.zeros_like(h_core)
+    for l_value, reduced_block in reduced_fock.items():
+        fock += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    return fock
 
 
 def build_fock_from_active_quartets(
@@ -714,6 +867,7 @@ def analyze_two_electron_integrals(
     threshold: float = 1.0e-12,
 ) -> dict[str, object]:
     structured_eri = build_structured_eri_repository(mol, eri, threshold=threshold)
+    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri, threshold=threshold)
     active_quartet_map = {quartet.l_values: quartet for quartet in structured_eri.active_quartets}
 
     ao_ang = ao_angular_momentum_for_each_ao(mol)
@@ -769,6 +923,28 @@ def analyze_two_electron_integrals(
         key=lambda quartet: quartet["frobenius_norm"],
         reverse=True,
     )
+    reduced_pair_summaries = [
+        {
+            "labels": [pair_block.output_label, pair_block.density_label],
+            "l_values": [pair_block.l_output, pair_block.l_density],
+            "reduced_radial_shape": [
+                pair_block.output_radial_functions,
+                pair_block.output_radial_functions,
+                pair_block.density_radial_functions,
+                pair_block.density_radial_functions,
+            ],
+            "coulomb_max_abs": pair_block.coulomb_max_abs,
+            "exchange_max_abs": pair_block.exchange_max_abs,
+            "coulomb_frobenius_norm": pair_block.coulomb_frobenius_norm,
+            "exchange_frobenius_norm": pair_block.exchange_frobenius_norm,
+        }
+        for _, pair_block in sorted(reduced_radial_eri.pair_blocks.items())
+    ]
+    dominant_reduced_pairs = sorted(
+        reduced_pair_summaries,
+        key=lambda item: max(item["coulomb_frobenius_norm"], item["exchange_frobenius_norm"]),
+        reverse=True,
+    )
     return {
         "threshold": threshold,
         "total_angular_quartets": len(quartet_summaries),
@@ -776,6 +952,14 @@ def analyze_two_electron_integrals(
         "inactive_angular_quartets": len(quartet_summaries) - active_count,
         "active_ratio": float(active_count / len(quartet_summaries)) if quartet_summaries else 0.0,
         "unique_canonical_blocks": len(structured_eri.block_map),
+        "active_reduced_radial_pair_blocks": len(reduced_radial_eri.pair_blocks),
+        "reduced_pair_compression_ratio": (
+            float(active_count / len(reduced_radial_eri.pair_blocks))
+            if reduced_radial_eri.pair_blocks
+            else 1.0
+        ),
+        "dominant_reduced_radial_pairs": dominant_reduced_pairs[:12],
         "dominant_active_quartets": active_sorted[:12],
         "quartet_summaries": quartet_summaries,
+        "reduced_radial_pair_summaries": reduced_pair_summaries,
     }

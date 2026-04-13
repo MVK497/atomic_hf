@@ -108,6 +108,8 @@ def print_two_electron_integral_summary(summary: dict[str, object]) -> None:
     print(f"  Inactive angular quartets: {summary['inactive_angular_quartets']}")
     print(f"  Active ratio: {summary['active_ratio']:.3f}")
     print(f"  Unique canonical quartet blocks: {summary['unique_canonical_blocks']}")
+    print(f"  Active reduced radial pair blocks: {summary['active_reduced_radial_pair_blocks']}")
+    print(f"  Quartet-to-pair compression ratio: {summary['reduced_pair_compression_ratio']:.3f}")
     print("  Dominant active quartets:")
     for quartet in summary["dominant_active_quartets"]:
         labels = ",".join(quartet["labels"])
@@ -116,6 +118,16 @@ def print_two_electron_integral_summary(summary: dict[str, object]) -> None:
             f"reduced = {quartet['reduced_radial_shape']}, "
             f"max|eri| = {quartet['max_abs']:.3e}, "
             f"||eri|| = {quartet['frobenius_norm']:.3e}"
+        )
+    print("  Dominant reduced radial pair blocks:")
+    for pair_block in summary["dominant_reduced_radial_pairs"]:
+        labels = ",".join(pair_block["labels"])
+        print(
+            f"    ({labels}): reduced = {pair_block['reduced_radial_shape']}, "
+            f"max|J| = {pair_block['coulomb_max_abs']:.3e}, "
+            f"max|K| = {pair_block['exchange_max_abs']:.3e}, "
+            f"||J|| = {pair_block['coulomb_frobenius_norm']:.3e}, "
+            f"||K|| = {pair_block['exchange_frobenius_norm']:.3e}"
         )
 
 
@@ -168,8 +180,7 @@ def print_rhf_result(result: AtomicRHFResult, show_history: bool) -> None:
     print(
         "Fock builder: "
         f"{result.fock_build_summary['builder']} "
-        f"(active quartets={result.fock_build_summary['active_angular_quartets']}, "
-        f"unique blocks={result.fock_build_summary['unique_canonical_blocks']})"
+        f"(reduced pair blocks={result.fock_build_summary['active_reduced_radial_pair_blocks']})"
     )
     print()
     print("MO occupations / energies")
