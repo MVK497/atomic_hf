@@ -20,10 +20,11 @@ from .blocks import (
     analyze_two_electron_integrals,
     blocked_generalized_eigh,
     build_atomic_reference_density,
+    build_reduced_radial_eri_repository,
     build_spin_density_from_block_occupations,
     build_spin_population_by_l,
+    build_uhf_fock_atomic_decomposed,
     build_structured_eri_repository,
-    build_uhf_fock_from_active_quartets,
     combine_spin_blocks,
     compute_diis_error,
     compute_uhf_s2,
@@ -92,6 +93,7 @@ def run_atomic_uhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
+    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
     structured_eri = build_structured_eri_repository(mol, eri)
 
     overlap_eigvals, overlap_eigvecs = np.linalg.eigh(s)
@@ -129,10 +131,12 @@ def run_atomic_uhf(
 
     previous_energy: float | None = None
     for iteration in range(1, max_iter + 1):
-        fock_alpha, fock_beta = build_uhf_fock_from_active_quartets(
+        fock_alpha, fock_beta = build_uhf_fock_atomic_decomposed(
             h_core,
             density_alpha,
             density_beta,
+            mol,
+            reduced_radial_eri,
             structured_eri,
         )
         if use_diis and iteration >= diis_start_cycle:
@@ -168,10 +172,12 @@ def run_atomic_uhf(
         if damping_factor > 0.0 and iteration <= damping_cycles:
             new_density_alpha = damp_density(density_alpha, new_density_alpha, damping_factor)
             new_density_beta = damp_density(density_beta, new_density_beta, damping_factor)
-        new_fock_alpha, new_fock_beta = build_uhf_fock_from_active_quartets(
+        new_fock_alpha, new_fock_beta = build_uhf_fock_atomic_decomposed(
             h_core,
             new_density_alpha,
             new_density_beta,
+            mol,
+            reduced_radial_eri,
             structured_eri,
         )
 
@@ -255,7 +261,8 @@ def run_atomic_uhf(
                     "level_shift": level_shift,
                 },
                 fock_build_summary={
-                    "builder": "structured_one_center_quartets",
+                    "builder": "reduced_radial_plus_residual_quartets",
+                    "active_reduced_radial_pair_blocks": len(reduced_radial_eri.pair_blocks),
                     "active_angular_quartets": len(structured_eri.active_quartets),
                     "unique_canonical_blocks": len(structured_eri.block_map),
                 },

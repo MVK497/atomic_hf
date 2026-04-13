@@ -21,7 +21,9 @@ from atomic_hf.blocks import (
     build_fock_from_active_quartets,
     build_reduced_radial_eri_repository,
     build_rhf_fock_from_reduced_radial_eri,
+    build_structured_eri_repository,
     build_uhf_fock,
+    build_uhf_fock_atomic_decomposed,
     build_uhf_fock_from_active_quartets,
 )
 
@@ -190,3 +192,44 @@ def test_quartet_screened_uhf_fock_matches_dense_builder() -> None:
 
     assert np.allclose(screened_alpha, dense_alpha, atol=1.0e-12, rtol=1.0e-12)
     assert np.allclose(screened_beta, dense_beta, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_atomic_decomposed_uhf_fock_matches_dense_builder() -> None:
+    mol = build_atomic_molecule(AtomicSpec(symbol="O", basis="sto-3g", spin=2))
+    h_core = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+    eri = mol.intor("int2e")
+    density_alpha = np.array(
+        [
+            [1.01, 0.02, 0.00, 0.01, -0.01],
+            [0.02, 0.88, 0.01, 0.00, 0.01],
+            [0.00, 0.01, 0.36, 0.02, 0.00],
+            [0.01, 0.00, 0.02, 0.35, -0.01],
+            [-0.01, 0.01, 0.00, -0.01, 0.34],
+        ]
+    )
+    density_beta = np.array(
+        [
+            [0.99, -0.01, 0.01, 0.00, 0.00],
+            [-0.01, 0.79, 0.00, -0.01, 0.01],
+            [0.01, 0.00, 0.25, 0.00, 0.01],
+            [0.00, -0.01, 0.00, 0.24, 0.00],
+            [0.00, 0.01, 0.01, 0.00, 0.23],
+        ]
+    )
+    density_alpha = 0.5 * (density_alpha + density_alpha.T)
+    density_beta = 0.5 * (density_beta + density_beta.T)
+    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
+    structured_eri = build_structured_eri_repository(mol, eri)
+
+    dense_alpha, dense_beta = build_uhf_fock(h_core, eri, density_alpha, density_beta)
+    decomposed_alpha, decomposed_beta = build_uhf_fock_atomic_decomposed(
+        h_core,
+        density_alpha,
+        density_beta,
+        mol,
+        reduced_radial_eri,
+        structured_eri,
+    )
+
+    assert np.allclose(decomposed_alpha, dense_alpha, atol=1.0e-12, rtol=1.0e-12)
+    assert np.allclose(decomposed_beta, dense_beta, atol=1.0e-12, rtol=1.0e-12)

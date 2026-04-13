@@ -221,7 +221,8 @@ def print_uhf_result(result: AtomicUHFResult, show_history: bool) -> None:
     print(
         "Fock builder: "
         f"{result.fock_build_summary['builder']} "
-        f"(active quartets={result.fock_build_summary['active_angular_quartets']}, "
+        f"(reduced pair blocks={result.fock_build_summary['active_reduced_radial_pair_blocks']}, "
+        f"active quartets={result.fock_build_summary['active_angular_quartets']}, "
         f"unique blocks={result.fock_build_summary['unique_canonical_blocks']})"
     )
     print(f"<S^2>: {result.s2:.12f}")

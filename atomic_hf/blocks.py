@@ -157,6 +157,16 @@ def build_reduced_density_by_l(
     return reduced_density
 
 
+def build_spherical_density_component(
+    density: np.ndarray,
+    mol: gto.Mole,
+) -> np.ndarray:
+    spherical_density = np.zeros_like(density)
+    for l_value, reduced_block in build_reduced_density_by_l(density, mol).items():
+        spherical_density += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    return spherical_density
+
+
 def blocked_eigensystem(
     fock: np.ndarray,
     overlap: np.ndarray,
@@ -657,6 +667,99 @@ def build_rhf_fock_from_reduced_radial_eri(
     for l_value, reduced_block in reduced_fock.items():
         fock += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
     return fock
+
+
+def build_uhf_fock_from_reduced_radial_eri(
+    h_core: np.ndarray,
+    density_alpha: np.ndarray,
+    density_beta: np.ndarray,
+    mol: gto.Mole,
+    reduced_eri: ReducedRadialERIRepository,
+) -> tuple[np.ndarray, np.ndarray]:
+    reduced_density_alpha = build_reduced_density_by_l(density_alpha, mol)
+    reduced_density_beta = build_reduced_density_by_l(density_beta, mol)
+    reduced_density_total = {
+        l_value: reduced_density_alpha.get(l_value, 0.0) + reduced_density_beta.get(l_value, 0.0)
+        for l_value in set(reduced_density_alpha) | set(reduced_density_beta)
+    }
+    reduced_hcore = {
+        l_value: reduced_matrix_for_l(h_core, mol, l_value)[0]
+        for l_value in reduced_density_total
+    }
+    reduced_fock_alpha = {l_value: np.array(reduced_hcore[l_value], copy=True) for l_value in reduced_density_total}
+    reduced_fock_beta = {l_value: np.array(reduced_hcore[l_value], copy=True) for l_value in reduced_density_total}
+
+    for (l_output, l_density), pair_block in reduced_eri.pair_blocks.items():
+        total_block = reduced_density_total.get(l_density)
+        if total_block is not None and np.size(total_block):
+            coulomb_contrib = np.einsum(
+                "rs,pqrs->pq",
+                total_block,
+                pair_block.coulomb_tensor,
+                optimize=True,
+            )
+            reduced_fock_alpha[l_output] += coulomb_contrib
+            reduced_fock_beta[l_output] += coulomb_contrib
+
+        alpha_block = reduced_density_alpha.get(l_density)
+        if alpha_block is not None and np.size(alpha_block):
+            reduced_fock_alpha[l_output] -= np.einsum(
+                "rs,pqrs->pq",
+                alpha_block,
+                pair_block.exchange_tensor,
+                optimize=True,
+            )
+
+        beta_block = reduced_density_beta.get(l_density)
+        if beta_block is not None and np.size(beta_block):
+            reduced_fock_beta[l_output] -= np.einsum(
+                "rs,pqrs->pq",
+                beta_block,
+                pair_block.exchange_tensor,
+                optimize=True,
+            )
+
+    fock_alpha = np.zeros_like(h_core)
+    fock_beta = np.zeros_like(h_core)
+    for l_value, reduced_block in reduced_fock_alpha.items():
+        fock_alpha += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    for l_value, reduced_block in reduced_fock_beta.items():
+        fock_beta += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    return fock_alpha, fock_beta
+
+
+def build_uhf_fock_atomic_decomposed(
+    h_core: np.ndarray,
+    density_alpha: np.ndarray,
+    density_beta: np.ndarray,
+    mol: gto.Mole,
+    reduced_eri: ReducedRadialERIRepository,
+    structured_eri: StructuredERIRepository,
+) -> tuple[np.ndarray, np.ndarray]:
+    spherical_alpha = build_spherical_density_component(density_alpha, mol)
+    spherical_beta = build_spherical_density_component(density_beta, mol)
+    residual_alpha = density_alpha - spherical_alpha
+    residual_beta = density_beta - spherical_beta
+
+    fock_alpha, fock_beta = build_uhf_fock_from_reduced_radial_eri(
+        h_core,
+        spherical_alpha,
+        spherical_beta,
+        mol,
+        reduced_eri,
+    )
+
+    if np.linalg.norm(residual_alpha) > 1.0e-14 or np.linalg.norm(residual_beta) > 1.0e-14:
+        correction_alpha, correction_beta = build_uhf_fock_from_active_quartets(
+            np.zeros_like(h_core),
+            residual_alpha,
+            residual_beta,
+            structured_eri,
+        )
+        fock_alpha += correction_alpha
+        fock_beta += correction_beta
+
+    return fock_alpha, fock_beta
 
 
 def build_fock_from_active_quartets(
