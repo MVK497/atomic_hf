@@ -40,6 +40,11 @@ BENCHMARK_BASIS_FALLBACKS = (
     "dyall_v2z",
 )
 
+LIGHTWEIGHT_BENCHMARK_BASIS_FALLBACKS = (
+    "minao",
+    "lanl2dz",
+)
+
 
 def _basis_is_available(symbol: str, basis: str) -> bool:
     try:
@@ -55,6 +60,28 @@ def _resolve_benchmark_basis(symbol: str, basis: str) -> str:
         if _basis_is_available(symbol, candidate):
             return candidate
     raise ValueError(f"No available benchmark basis was found for {symbol}.")
+
+
+def _fallback_candidates_for_requested_basis(basis: str) -> tuple[str, ...]:
+    requested_basis = str(basis).lower()
+    if requested_basis == "sto-3g":
+        return LIGHTWEIGHT_BENCHMARK_BASIS_FALLBACKS
+    return BENCHMARK_BASIS_FALLBACKS
+
+
+def _candidate_benchmark_bases(symbol: str, basis: str) -> list[str]:
+    requested_basis = str(basis)
+    if _basis_is_available(symbol, requested_basis):
+        return [requested_basis]
+
+    # When the requested benchmark basis is unavailable, fall back conservatively.
+    # For lightweight sweeps such as sto-3g, avoid escalating into very heavy bases.
+    candidates = [
+        candidate
+        for candidate in _fallback_candidates_for_requested_basis(requested_basis)
+        if candidate != requested_basis and _basis_is_available(symbol, candidate)
+    ]
+    return candidates[:1]
 
 
 def _reference_atomic_energy(spec: AtomicSpec, method: str) -> float:
@@ -170,12 +197,27 @@ def run_benchmark_entry(
 ) -> BenchmarkEntry:
     start = time.perf_counter()
     selected_method = method
-    candidate_bases = [str(spec.basis)] + [basis for basis in BENCHMARK_BASIS_FALLBACKS if basis != str(spec.basis)]
+    candidate_bases = _candidate_benchmark_bases(spec.symbol, str(spec.basis))
     last_error: Exception | None = None
     last_basis = str(spec.basis)
+
+    if not candidate_bases:
+        return BenchmarkEntry(
+            symbol=spec.symbol,
+            atomic_number=atomic_number(spec.symbol),
+            method=selected_method,
+            spin=resolve_spin(spec),
+            basis=last_basis,
+            energy=None,
+            reference_energy=None,
+            absolute_energy_error=None,
+            iterations=None,
+            elapsed_seconds=time.perf_counter() - start,
+            status="failed",
+            message=f"Requested benchmark basis {spec.basis} is unavailable for {spec.symbol}.",
+        )
+
     for benchmark_basis in candidate_bases:
-        if not _basis_is_available(spec.symbol, benchmark_basis):
-            continue
         benchmark_spec = AtomicSpec(
             symbol=spec.symbol,
             basis=benchmark_basis,
