@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Real
 
 from pyscf import gto
 from pyscf.data import elements
@@ -290,7 +291,10 @@ def analyze_basis_engineering(mol: gto.Mole) -> dict[str, object]:
 
     for shell_index, shell in enumerate(raw_basis, start=1):
         l_value = int(shell[0])
-        primitives = shell[1:]
+        primitive_start = 1
+        while primitive_start < len(shell) and isinstance(shell[primitive_start], Real):
+            primitive_start += 1
+        primitives = shell[primitive_start:]
         nprim = len(primitives)
         nctr = len(primitives[0]) - 1 if primitives else 0
         contraction_type = "general" if nctr > 1 else "segmented"

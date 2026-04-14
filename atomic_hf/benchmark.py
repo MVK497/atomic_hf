@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -71,10 +73,100 @@ def _reference_atomic_energy(spec: AtomicSpec, method: str) -> float:
     return float(reference.kernel())
 
 
+_ENTRY_RUNNER = r"""
+import json
+import sys
+from atomic_hf import AtomicSpec, run_atomic_rhf, run_atomic_uhf
+from atomic_hf.benchmark import _reference_atomic_energy
+
+symbol = sys.argv[1]
+basis = sys.argv[2]
+charge = int(sys.argv[3])
+spin_arg = sys.argv[4]
+method = sys.argv[5]
+compare_reference = bool(int(sys.argv[6]))
+spin = None if spin_arg == "None" else int(spin_arg)
+spec = AtomicSpec(symbol=symbol, basis=basis, charge=charge, spin=spin)
+
+try:
+    if method == "rhf":
+        result = run_atomic_rhf(spec, with_analysis=False)
+        payload = {
+            "symbol": result.symbol,
+            "atomic_number": result.atomic_number,
+            "spin": result.spin,
+            "basis": result.basis,
+            "energy": float(result.energy),
+            "iterations": int(result.iterations),
+        }
+    else:
+        result = run_atomic_uhf(spec, with_analysis=False)
+        payload = {
+            "symbol": result.symbol,
+            "atomic_number": result.atomic_number,
+            "spin": result.spin,
+            "basis": result.basis,
+            "energy": float(result.energy),
+            "iterations": int(result.iterations),
+        }
+    if compare_reference:
+        payload["reference_energy"] = float(_reference_atomic_energy(spec, method))
+    else:
+        payload["reference_energy"] = None
+    payload["status"] = "ok"
+    payload["message"] = None
+except Exception as exc:
+    payload = {
+        "symbol": symbol,
+        "atomic_number": None,
+        "spin": spin,
+        "basis": basis,
+        "energy": None,
+        "iterations": None,
+        "reference_energy": None,
+        "status": "failed",
+        "message": str(exc),
+    }
+print(json.dumps(payload))
+"""
+
+
+def _run_entry_subprocess(
+    spec: AtomicSpec,
+    method: str,
+    compare_reference: bool,
+    timeout_seconds: int | None,
+) -> dict[str, object]:
+    command = [
+        sys.executable,
+        "-c",
+        _ENTRY_RUNNER,
+        spec.symbol,
+        str(spec.basis),
+        str(spec.charge),
+        "None" if spec.spin is None else str(spec.spin),
+        method,
+        "1" if compare_reference else "0",
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        timeout=timeout_seconds,
+        check=False,
+    )
+    stdout = completed.stdout.strip().splitlines()
+    if not stdout:
+        raise RuntimeError(completed.stderr.strip() or "Benchmark subprocess produced no output.")
+    return json.loads(stdout[-1])
+
+
 def run_benchmark_entry(
     spec: AtomicSpec,
     method: str = "auto",
     compare_reference: bool = True,
+    timeout_seconds: int | None = 60,
 ) -> BenchmarkEntry:
     start = time.perf_counter()
     selected_method = method
@@ -95,29 +187,36 @@ def run_benchmark_entry(
             selected_method = method
             if selected_method == "auto":
                 selected_method = "rhf" if resolve_spin(benchmark_spec) == 0 else "uhf"
-
-            if selected_method == "rhf":
-                result = run_atomic_rhf(benchmark_spec)
-            else:
-                result = run_atomic_uhf(benchmark_spec)
+            payload = _run_entry_subprocess(
+                benchmark_spec,
+                selected_method,
+                compare_reference=compare_reference,
+                timeout_seconds=timeout_seconds,
+            )
             elapsed = time.perf_counter() - start
+            if payload["status"] != "ok":
+                raise RuntimeError(str(payload["message"]))
 
-            reference_energy = _reference_atomic_energy(benchmark_spec, selected_method) if compare_reference else None
-            error = None if reference_energy is None else abs(result.energy - reference_energy)
+            reference_energy = payload["reference_energy"]
+            error = None if reference_energy is None else abs(float(payload["energy"]) - float(reference_energy))
             return BenchmarkEntry(
-                symbol=result.symbol,
-                atomic_number=result.atomic_number,
+                symbol=str(payload["symbol"]),
+                atomic_number=int(payload["atomic_number"]),
                 method=selected_method,
-                spin=result.spin,
-                basis=result.basis,
-                energy=float(result.energy),
+                spin=int(payload["spin"]),
+                basis=str(payload["basis"]),
+                energy=float(payload["energy"]),
                 reference_energy=reference_energy,
                 absolute_energy_error=error,
-                iterations=int(result.iterations),
+                iterations=int(payload["iterations"]),
                 elapsed_seconds=elapsed,
                 status="ok",
                 message=None,
             )
+        except subprocess.TimeoutExpired as exc:  # pragma: no cover - long-running entries should not block the sweep
+            last_error = TimeoutError(f"Benchmark entry exceeded the {timeout_seconds}s timeout.")
+            last_basis = benchmark_basis
+            continue
         except Exception as exc:  # pragma: no cover - benchmark tool should keep sweeping after failures
             last_error = exc
             last_basis = benchmark_basis
@@ -146,12 +245,20 @@ def run_benchmark_sweep(
     basis: str = "sto-3g",
     method: str = "auto",
     compare_reference: bool = True,
+    timeout_seconds: int | None = 60,
 ) -> dict[str, object]:
     entries: list[BenchmarkEntry] = []
     for atomic_number in range(min_z, max_z + 1):
         symbol = elements.ELEMENTS[atomic_number]
         spec = AtomicSpec(symbol=symbol, basis=basis)
-        entries.append(run_benchmark_entry(spec, method=method, compare_reference=compare_reference))
+        entries.append(
+            run_benchmark_entry(
+                spec,
+                method=method,
+                compare_reference=compare_reference,
+                timeout_seconds=timeout_seconds,
+            )
+        )
 
     successful = [entry for entry in entries if entry.status == "ok"]
     failed = [entry for entry in entries if entry.status != "ok"]
@@ -167,6 +274,72 @@ def run_benchmark_sweep(
         "mean_absolute_energy_error": (sum(errors) / len(errors)) if errors else None,
         "entries": [asdict(entry) for entry in entries],
     }
+
+
+def load_benchmark_json(input_path: str | Path) -> dict[str, object]:
+    path = Path(input_path)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def run_benchmark_sweep_checkpointed(
+    output_path: str | Path,
+    min_z: int = 1,
+    max_z: int = 102,
+    basis: str = "sto-3g",
+    method: str = "auto",
+    compare_reference: bool = True,
+    resume: bool = True,
+    timeout_seconds: int | None = 60,
+) -> dict[str, object]:
+    path = Path(output_path)
+    if resume and path.exists():
+        summary = load_benchmark_json(path)
+        entries = list(summary.get("entries", []))
+        done = {int(entry["atomic_number"]) for entry in entries}
+    else:
+        entries = []
+        done = set()
+        summary = {
+            "range": [min_z, max_z],
+            "basis": basis,
+            "method": method,
+            "compare_reference": compare_reference,
+            "successful_cases": 0,
+            "failed_cases": 0,
+            "max_absolute_energy_error": None,
+            "mean_absolute_energy_error": None,
+            "entries": entries,
+        }
+
+    for atomic_number in range(min_z, max_z + 1):
+        if atomic_number in done:
+            continue
+        symbol = elements.ELEMENTS[atomic_number]
+        spec = AtomicSpec(symbol=symbol, basis=basis)
+        entry = run_benchmark_entry(
+            spec,
+            method=method,
+            compare_reference=compare_reference,
+            timeout_seconds=timeout_seconds,
+        )
+        entries.append(asdict(entry))
+
+        successful = [item for item in entries if item["status"] == "ok"]
+        failed = [item for item in entries if item["status"] != "ok"]
+        errors = [item["absolute_energy_error"] for item in successful if item["absolute_energy_error"] is not None]
+        summary.update(
+            {
+                "successful_cases": len(successful),
+                "failed_cases": len(failed),
+                "max_absolute_energy_error": max(errors) if errors else None,
+                "mean_absolute_energy_error": (sum(errors) / len(errors)) if errors else None,
+                "entries": entries,
+                "last_completed_atomic_number": atomic_number,
+            }
+        )
+        write_benchmark_json(summary, path)
+
+    return summary
 
 
 def write_benchmark_json(summary: dict[str, object], output_path: str | Path) -> None:

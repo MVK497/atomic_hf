@@ -15,10 +15,14 @@ The code focuses on single-center atoms and ions rather than general molecules. 
   - `core`: blocked one-electron guess
 - Blocked `RHF` diagonalization by angular momentum
 - Blocked `UHF` diagonalization for separate alpha/beta channels
+- Two UHF occupation modes:
+  - `integer`: conventional spin-orbital filling within each angular block
+  - `spherical_average`: fractional atomic-shell filling for more radial/open-shell-friendly behavior
 - One-center one-electron integral reduction analysis
 - Structured one-center ERI quartet repository with canonical-block reuse
+- Gaunt/Wigner-channel one-center ERI decomposition for radial-plus-angular Fock construction
 - Exact reduced-radial RHF Fock construction for spherically averaged closed-shell atoms
-- Exact UHF Fock decomposition into reduced-radial spherical part plus residual quartet correction
+- Exact UHF Fock decomposition into Gaunt-channel spherical part plus residual quartet correction
 - Quartet-screened `RHF` / `UHF` Fock construction
 - Basis engineering analysis:
   - segmented vs general contraction detection
@@ -26,6 +30,7 @@ The code focuses on single-center atoms and ions rather than general molecules. 
   - angular-momentum-resolved contraction summaries
 - Atomic electron-configuration summary with PySCF-informed exception handling
 - Benchmark sweep tooling with automatic basis fallback for heavier atoms
+- Checkpointed/resumable benchmark JSON output and per-entry timeout control
 - Automated tests
 
 ## Project Layout
@@ -79,6 +84,12 @@ Tune SCF stabilization:
 python3 run_atomic_hf.py Cr --method uhf --damping 0.25 --damping-cycles 8 --level-shift 0.7
 ```
 
+Use the more atomic, shell-averaged open-shell occupation model:
+
+```bash
+python3 run_atomic_hf.py O --method uhf --occupation-mode spherical_average
+```
+
 Print SCF history:
 
 ```bash
@@ -97,6 +108,12 @@ Benchmark with a JSON report:
 python3 run_atomic_benchmark.py --min-z 1 --max-z 30 --basis sto-3g --json-output benchmarks_sto3g.json
 ```
 
+Resume a long benchmark sweep with per-entry timeouts:
+
+```bash
+python3 run_atomic_benchmark.py --min-z 1 --max-z 102 --basis sto-3g --no-reference --json-output benchmarks/z1_z102_auto_noref.json --entry-timeout 20
+```
+
 ## Output Highlights
 
 For each run, the program reports:
@@ -112,6 +129,7 @@ For each run, the program reports:
 - dominant one-center two-electron integral quartets
 - dominant reduced-radial pair blocks for the one-center ERI tensor
 - active quartet count and unique canonical quartet-block count
+- dominant Gaunt/Wigner channel terms in the one-center ERI decomposition
 
 ## Tests
 
@@ -124,7 +142,7 @@ pytest
 
 - `RHF` is limited to closed-shell atoms and ions
 - Heavy atoms may require a larger or relativistic basis; benchmark mode can fall back automatically, but ordinary CLI runs still use the basis you request
-- The one-center ERI acceleration now includes an exact reduced-radial RHF builder and an exact reduced-radial-plus-residual decomposition for UHF, but it does not yet implement a fully Gaunt/Wigner-factorized atomic ERI formulation
+- The one-center ERI acceleration now includes Gaunt/Wigner-channel factorization plus residual-quartet correction, but there is still room to push further toward a fully production-grade atomic ERI engine
 - General-contraction structure is analyzed, but contraction-aware integral/Fock acceleration is still incomplete
 - The project does not yet include relativistic Hamiltonians, ECP-aware workflows, or production-grade occupation control for every exotic ion/state
 - A full `Z = 1 .. 102` production benchmark is still a workload for the benchmark tool, not a completed published data set inside the repository

@@ -22,9 +22,9 @@ from .blocks import (
     build_atomic_mo_occupations_from_spec,
     build_atomic_reference_density,
     build_density_from_occupations,
-    build_reduced_radial_eri_repository,
+    build_gaunt_channel_eri_repository,
     damp_density,
-    build_rhf_fock_from_reduced_radial_eri,
+    build_rhf_fock_from_gaunt_channels,
     compute_diis_error,
 )
 
@@ -67,6 +67,7 @@ def run_atomic_rhf(
     damping_cycles: int = 4,
     level_shift: float = 0.5,
     diis_start_cycle: int = 2,
+    with_analysis: bool = True,
 ) -> AtomicRHFResult:
     spin = resolve_spin(spec)
     if spin != 0:
@@ -82,7 +83,7 @@ def run_atomic_rhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
-    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
+    gaunt_channel_eri = build_gaunt_channel_eri_repository(mol, eri)
 
     mo_occ = build_atomic_mo_occupations_from_spec(spec, mol)
     history: list[float] = []
@@ -102,7 +103,7 @@ def run_atomic_rhf(
     x = overlap_eigvecs @ np.diag(overlap_eigvals ** -0.5) @ overlap_eigvecs.T
 
     for iteration in range(1, max_iter + 1):
-        fock = build_rhf_fock_from_reduced_radial_eri(h_core, density, mol, reduced_radial_eri)
+        fock = build_rhf_fock_from_gaunt_channels(h_core, density, mol, gaunt_channel_eri)
         if use_diis and iteration >= diis_start_cycle:
             diis_error = compute_diis_error(fock, density, s, x)
             diis_helper.push(fock, diis_error)
@@ -115,7 +116,7 @@ def run_atomic_rhf(
         new_density = build_density_from_occupations(coefficients, mo_occ)
         if damping_factor > 0.0 and iteration <= damping_cycles:
             new_density = damp_density(density, new_density, damping_factor)
-        new_fock = build_rhf_fock_from_reduced_radial_eri(h_core, new_density, mol, reduced_radial_eri)
+        new_fock = build_rhf_fock_from_gaunt_channels(h_core, new_density, mol, gaunt_channel_eri)
         electronic_energy = 0.5 * float(np.sum(new_density * (h_core + new_fock)))
         total_energy = electronic_energy + e_nuc
         history.append(total_energy)
@@ -124,9 +125,10 @@ def run_atomic_rhf(
         if previous_energy is not None and abs(total_energy - previous_energy) < e_tol and density_change < d_tol:
             orbital_energies, coefficients, symmetry_blocks = blocked_generalized_eigh(new_fock, s, mol)
             final_density = build_density_from_occupations(coefficients, mo_occ)
+            configuration_summary = build_configuration_summary(spec)
             return AtomicRHFResult(
                 symbol=canonical_symbol(spec.symbol),
-                atomic_number=int(build_configuration_summary(spec)["atomic_number"]),
+                atomic_number=int(configuration_summary["atomic_number"]),
                 charge=spec.charge,
                 spin=spin,
                 basis=spec.basis,
@@ -137,12 +139,12 @@ def run_atomic_rhf(
                 mo_occupations=np.array(mo_occ, copy=True),
                 iterations=iteration,
                 history=history,
-                basis_summary=summarize_basis_shells(mol),
-                basis_engineering_summary=analyze_basis_engineering(mol),
-                configuration_summary=build_configuration_summary(spec),
+                basis_summary=summarize_basis_shells(mol) if with_analysis else [],
+                basis_engineering_summary=analyze_basis_engineering(mol) if with_analysis else {},
+                configuration_summary=configuration_summary,
                 symmetry_blocks=symmetry_blocks,
-                one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core),
-                two_electron_integral_summary=analyze_two_electron_integrals(mol, eri),
+                one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core) if with_analysis else {},
+                two_electron_integral_summary=analyze_two_electron_integrals(mol, eri) if with_analysis else {},
                 spherical_average=True,
                 initial_guess=initial_guess,
                 stabilization_summary={
@@ -154,8 +156,8 @@ def run_atomic_rhf(
                     "level_shift": level_shift,
                 },
                 fock_build_summary={
-                    "builder": "reduced_radial_pair_blocks",
-                    "active_reduced_radial_pair_blocks": len(reduced_radial_eri.pair_blocks),
+                    "builder": "gaunt_channel_reduced_radial",
+                    "active_reduced_radial_pair_blocks": len(gaunt_channel_eri.pair_blocks),
                 },
             )
 

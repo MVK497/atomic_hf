@@ -6,6 +6,7 @@ import numpy as np
 from pyscf import gto
 from pyscf.lib import param
 from pyscf.scf import atom_hf, hf
+from sympy.physics.wigner import real_gaunt
 
 from .atom import AtomicSpec, angular_momentum_label, build_subshell_occupations
 
@@ -100,6 +101,26 @@ class ReducedRadialPairBlock:
 class ReducedRadialERIRepository:
     threshold: float
     pair_blocks: dict[tuple[int, int], ReducedRadialPairBlock]
+
+
+@dataclass(frozen=True)
+class GauntChannelPairBlock:
+    l_output: int
+    l_density: int
+    output_label: str
+    density_label: str
+    output_radial_functions: int
+    density_radial_functions: int
+    coulomb_channels: dict[int, np.ndarray]
+    exchange_channels: dict[int, np.ndarray]
+    coulomb_weights: dict[int, float]
+    exchange_weights: dict[int, float]
+
+
+@dataclass
+class GauntChannelERIRepository:
+    threshold: float
+    pair_blocks: dict[tuple[int, int], GauntChannelPairBlock]
 
 
 def compute_diis_error(fock: np.ndarray, density: np.ndarray, overlap: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -388,6 +409,7 @@ def rebalance_spin_population_by_l(
 def build_spin_mo_occupations_by_blocks(
     symmetry_blocks: list[dict[str, int | str]],
     electrons_by_l: dict[int, int],
+    mode: str = "spherical_average",
 ) -> np.ndarray:
     num_orbitals = 0
     for block in symmetry_blocks:
@@ -403,7 +425,30 @@ def build_spin_mo_occupations_by_blocks(
             raise ValueError(
                 f"Too many spin-{angular_momentum_label(l_value)} electrons ({count}) for block size {block_size}."
             )
-        occupations[start : start + count] = 1.0
+        degeneracy = int(block["degeneracy"])
+        radial_functions = int(block["radial_functions"])
+        if mode == "integer":
+            occupations[start : start + count] = 1.0
+        elif mode == "spherical_average":
+            occupations_l = np.zeros(block_size)
+            full_shells, remainder = divmod(count, degeneracy)
+            if full_shells > radial_functions:
+                raise ValueError(
+                    f"Too many spin-{angular_momentum_label(l_value)} electrons ({count}) for "
+                    f"{radial_functions} radial functions."
+                )
+            if full_shells:
+                occupations_l[: full_shells * degeneracy] = 1.0
+            if remainder:
+                if full_shells >= radial_functions:
+                    raise ValueError(
+                        f"Partially occupied spin-{angular_momentum_label(l_value)} shell exceeds the "
+                        f"available radial functions."
+                    )
+                occupations_l[full_shells * degeneracy : (full_shells + 1) * degeneracy] = remainder / degeneracy
+            occupations[start:stop] = occupations_l
+        else:
+            raise ValueError("Occupation mode must be 'spherical_average' or 'integer'.")
     return occupations
 
 
@@ -411,8 +456,9 @@ def build_spin_density_from_block_occupations(
     coefficients: np.ndarray,
     symmetry_blocks: list[dict[str, int | str]],
     electrons_by_l: dict[int, int],
+    mode: str = "spherical_average",
 ) -> tuple[np.ndarray, np.ndarray]:
-    occupations = build_spin_mo_occupations_by_blocks(symmetry_blocks, electrons_by_l)
+    occupations = build_spin_mo_occupations_by_blocks(symmetry_blocks, electrons_by_l, mode=mode)
     return build_density_from_occupations(coefficients, occupations), occupations
 
 
@@ -446,6 +492,108 @@ def build_fock(h_core: np.ndarray, eri: np.ndarray, density: np.ndarray) -> np.n
     coulomb = np.einsum("ls,mnls->mn", density, eri, optimize=True)
     exchange = np.einsum("ls,mlns->mn", density, eri, optimize=True)
     return h_core + coulomb - 0.5 * exchange
+
+
+def real_spherical_mu_order(l_value: int) -> list[int]:
+    if l_value == 0:
+        return [0]
+    if l_value == 1:
+        return [1, -1, 0]
+    if l_value == 2:
+        return [-2, -1, 0, 1, 2]
+    return list(range(-l_value, l_value + 1))
+
+
+def _gaunt_value(l1: int, l2: int, l3: int, mu1: int, mu2: int, mu3: int) -> float:
+    return float(real_gaunt(l1, l2, l3, mu1, mu2, mu3))
+
+
+def _angular_basis_tensors_for_pair(
+    l_output: int,
+    l_density: int,
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    mu_out = real_spherical_mu_order(l_output)
+    mu_den = real_spherical_mu_order(l_density)
+    deg_out = len(mu_out)
+    deg_den = len(mu_den)
+
+    coulomb_basis: dict[int, np.ndarray] = {}
+    exchange_basis: dict[int, np.ndarray] = {}
+    for k_value in range(0, l_output + l_output + 1):
+        coulomb_tensor = np.zeros((deg_out, deg_out, deg_den, deg_den))
+        for i, mu_i in enumerate(mu_out):
+            for j, mu_j in enumerate(mu_out):
+                for r, mu_r in enumerate(mu_den):
+                    for s, mu_s in enumerate(mu_den):
+                        value = 0.0
+                        for q in range(-k_value, k_value + 1):
+                            value += _gaunt_value(l_output, l_output, k_value, mu_i, mu_j, q) * _gaunt_value(
+                                l_density,
+                                l_density,
+                                k_value,
+                                mu_r,
+                                mu_s,
+                                q,
+                            )
+                        coulomb_tensor[i, j, r, s] = value
+        if np.linalg.norm(coulomb_tensor) > 1.0e-14:
+            coulomb_basis[k_value] = coulomb_tensor
+
+    for k_value in range(abs(l_output - l_density), l_output + l_density + 1):
+        exchange_tensor = np.zeros((deg_out, deg_den, deg_out, deg_den))
+        for i, mu_i in enumerate(mu_out):
+            for r, mu_r in enumerate(mu_den):
+                for j, mu_j in enumerate(mu_out):
+                    for s, mu_s in enumerate(mu_den):
+                        value = 0.0
+                        for q in range(-k_value, k_value + 1):
+                            value += _gaunt_value(l_output, l_density, k_value, mu_i, mu_r, q) * _gaunt_value(
+                                l_output,
+                                l_density,
+                                k_value,
+                                mu_j,
+                                mu_s,
+                                q,
+                            )
+                        exchange_tensor[i, r, j, s] = value
+        if np.linalg.norm(exchange_tensor) > 1.0e-14:
+            exchange_basis[k_value] = exchange_tensor
+
+    return coulomb_basis, exchange_basis
+
+
+def _project_angular_channels(
+    tensor: np.ndarray,
+    basis_by_k: dict[int, np.ndarray],
+) -> dict[int, np.ndarray]:
+    basis_items = sorted(basis_by_k.items())
+    if not basis_items:
+        return {}
+    basis_matrix = np.stack([basis.reshape(-1) for _, basis in basis_items], axis=0)
+    projector = np.linalg.pinv(basis_matrix.T)
+    radial_shape = tensor.shape[:-basis_items[0][1].ndim]
+    tensor_flat = tensor.reshape(-1, basis_matrix.shape[1]).T
+    channel_coefficients = projector @ tensor_flat
+    channels: dict[int, np.ndarray] = {}
+    for index, (k_value, _) in enumerate(basis_items):
+        channels[k_value] = channel_coefficients[index].reshape(radial_shape)
+    return channels
+
+
+def _reduced_channel_weights(
+    coulomb_basis: dict[int, np.ndarray],
+    exchange_basis: dict[int, np.ndarray],
+    output_degeneracy: int,
+) -> tuple[dict[int, float], dict[int, float]]:
+    coulomb_weights = {
+        k_value: float(np.einsum("iijj->", basis) / output_degeneracy)
+        for k_value, basis in coulomb_basis.items()
+    }
+    exchange_weights = {
+        k_value: float(np.einsum("ijij->", basis) / output_degeneracy)
+        for k_value, basis in exchange_basis.items()
+    }
+    return coulomb_weights, exchange_weights
 
 
 def _canonicalize_quartet_axes(
@@ -625,6 +773,84 @@ def build_reduced_radial_eri_repository(
     return ReducedRadialERIRepository(threshold=threshold, pair_blocks=pair_blocks)
 
 
+def build_gaunt_channel_eri_repository(
+    mol: gto.Mole,
+    eri: np.ndarray,
+    threshold: float = 1.0e-12,
+) -> GauntChannelERIRepository:
+    ao_ang = ao_angular_momentum_for_each_ao(mol)
+    unique_l = sorted(set(int(value) for value in ao_ang))
+    l_indices = {l_value: np.where(ao_ang == l_value)[0] for l_value in unique_l}
+
+    pair_blocks: dict[tuple[int, int], GauntChannelPairBlock] = {}
+    for l_output in unique_l:
+        idx_out = l_indices[l_output]
+        deg_out = 2 * l_output + 1
+        nrad_out = idx_out.size // deg_out
+        for l_density in unique_l:
+            idx_den = l_indices[l_density]
+            deg_den = 2 * l_density + 1
+            nrad_den = idx_den.size // deg_den
+            coulomb_basis, exchange_basis = _angular_basis_tensors_for_pair(l_output, l_density)
+            coulomb_weights, exchange_weights = _reduced_channel_weights(coulomb_basis, exchange_basis, deg_out)
+
+            full_coulomb = eri[np.ix_(idx_out, idx_out, idx_den, idx_den)].reshape(
+                nrad_out,
+                deg_out,
+                nrad_out,
+                deg_out,
+                nrad_den,
+                deg_den,
+                nrad_den,
+                deg_den,
+            )
+            full_coulomb = np.transpose(full_coulomb, axes=(0, 2, 4, 6, 1, 3, 5, 7))
+
+            full_exchange = eri[np.ix_(idx_out, idx_den, idx_out, idx_den)].reshape(
+                nrad_out,
+                deg_out,
+                nrad_den,
+                deg_den,
+                nrad_out,
+                deg_out,
+                nrad_den,
+                deg_den,
+            )
+            full_exchange = np.transpose(full_exchange, axes=(0, 4, 2, 6, 1, 3, 5, 7))
+
+            coulomb_channels = _project_angular_channels(full_coulomb, coulomb_basis)
+            exchange_channels = _project_angular_channels(full_exchange, exchange_basis)
+
+            # Keep only numerically meaningful channels.
+            coulomb_channels = {
+                k_value: tensor
+                for k_value, tensor in coulomb_channels.items()
+                if float(np.max(np.abs(tensor))) > threshold
+            }
+            exchange_channels = {
+                k_value: tensor
+                for k_value, tensor in exchange_channels.items()
+                if float(np.max(np.abs(tensor))) > threshold
+            }
+            if not coulomb_channels and not exchange_channels:
+                continue
+
+            pair_blocks[(l_output, l_density)] = GauntChannelPairBlock(
+                l_output=l_output,
+                l_density=l_density,
+                output_label=angular_momentum_label(l_output),
+                density_label=angular_momentum_label(l_density),
+                output_radial_functions=int(nrad_out),
+                density_radial_functions=int(nrad_den),
+                coulomb_channels=coulomb_channels,
+                exchange_channels=exchange_channels,
+                coulomb_weights=coulomb_weights,
+                exchange_weights=exchange_weights,
+            )
+
+    return GauntChannelERIRepository(threshold=threshold, pair_blocks=pair_blocks)
+
+
 def build_active_eri_quartets(
     mol: gto.Mole,
     eri: np.ndarray,
@@ -662,6 +888,44 @@ def build_rhf_fock_from_reduced_radial_eri(
             pair_block.exchange_tensor,
             optimize=True,
         )
+
+    fock = np.zeros_like(h_core)
+    for l_value, reduced_block in reduced_fock.items():
+        fock += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    return fock
+
+
+def build_rhf_fock_from_gaunt_channels(
+    h_core: np.ndarray,
+    density: np.ndarray,
+    mol: gto.Mole,
+    gaunt_eri: GauntChannelERIRepository,
+) -> np.ndarray:
+    reduced_density = build_reduced_density_by_l(density, mol)
+    reduced_hcore = {
+        l_value: reduced_matrix_for_l(h_core, mol, l_value)[0]
+        for l_value in reduced_density
+    }
+    reduced_fock = {l_value: np.array(reduced_hcore[l_value], copy=True) for l_value in reduced_density}
+
+    for (l_output, l_density), pair_block in gaunt_eri.pair_blocks.items():
+        density_block = reduced_density.get(l_density)
+        if density_block is None or density_block.size == 0:
+            continue
+        for k_value, channel_tensor in pair_block.coulomb_channels.items():
+            reduced_fock[l_output] += pair_block.coulomb_weights[k_value] * np.einsum(
+                "rs,pqrs->pq",
+                density_block,
+                channel_tensor,
+                optimize=True,
+            )
+        for k_value, channel_tensor in pair_block.exchange_channels.items():
+            reduced_fock[l_output] -= 0.5 * pair_block.exchange_weights[k_value] * np.einsum(
+                "rs,pqrs->pq",
+                density_block,
+                channel_tensor,
+                optimize=True,
+            )
 
     fock = np.zeros_like(h_core)
     for l_value, reduced_block in reduced_fock.items():
@@ -728,12 +992,74 @@ def build_uhf_fock_from_reduced_radial_eri(
     return fock_alpha, fock_beta
 
 
+def build_uhf_fock_from_gaunt_channels(
+    h_core: np.ndarray,
+    density_alpha: np.ndarray,
+    density_beta: np.ndarray,
+    mol: gto.Mole,
+    gaunt_eri: GauntChannelERIRepository,
+) -> tuple[np.ndarray, np.ndarray]:
+    reduced_density_alpha = build_reduced_density_by_l(density_alpha, mol)
+    reduced_density_beta = build_reduced_density_by_l(density_beta, mol)
+    reduced_density_total = {
+        l_value: reduced_density_alpha.get(l_value, 0.0) + reduced_density_beta.get(l_value, 0.0)
+        for l_value in set(reduced_density_alpha) | set(reduced_density_beta)
+    }
+    reduced_hcore = {
+        l_value: reduced_matrix_for_l(h_core, mol, l_value)[0]
+        for l_value in reduced_density_total
+    }
+    reduced_fock_alpha = {l_value: np.array(reduced_hcore[l_value], copy=True) for l_value in reduced_density_total}
+    reduced_fock_beta = {l_value: np.array(reduced_hcore[l_value], copy=True) for l_value in reduced_density_total}
+
+    for (l_output, l_density), pair_block in gaunt_eri.pair_blocks.items():
+        total_block = reduced_density_total.get(l_density)
+        if total_block is not None and np.size(total_block):
+            for k_value, channel_tensor in pair_block.coulomb_channels.items():
+                coulomb_contrib = pair_block.coulomb_weights[k_value] * np.einsum(
+                    "rs,pqrs->pq",
+                    total_block,
+                    channel_tensor,
+                    optimize=True,
+                )
+                reduced_fock_alpha[l_output] += coulomb_contrib
+                reduced_fock_beta[l_output] += coulomb_contrib
+
+        alpha_block = reduced_density_alpha.get(l_density)
+        if alpha_block is not None and np.size(alpha_block):
+            for k_value, channel_tensor in pair_block.exchange_channels.items():
+                reduced_fock_alpha[l_output] -= pair_block.exchange_weights[k_value] * np.einsum(
+                    "rs,pqrs->pq",
+                    alpha_block,
+                    channel_tensor,
+                    optimize=True,
+                )
+
+        beta_block = reduced_density_beta.get(l_density)
+        if beta_block is not None and np.size(beta_block):
+            for k_value, channel_tensor in pair_block.exchange_channels.items():
+                reduced_fock_beta[l_output] -= pair_block.exchange_weights[k_value] * np.einsum(
+                    "rs,pqrs->pq",
+                    beta_block,
+                    channel_tensor,
+                    optimize=True,
+                )
+
+    fock_alpha = np.zeros_like(h_core)
+    fock_beta = np.zeros_like(h_core)
+    for l_value, reduced_block in reduced_fock_alpha.items():
+        fock_alpha += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    for l_value, reduced_block in reduced_fock_beta.items():
+        fock_beta += expand_reduced_matrix_for_l(reduced_block, mol, l_value)
+    return fock_alpha, fock_beta
+
+
 def build_uhf_fock_atomic_decomposed(
     h_core: np.ndarray,
     density_alpha: np.ndarray,
     density_beta: np.ndarray,
     mol: gto.Mole,
-    reduced_eri: ReducedRadialERIRepository,
+    gaunt_eri: GauntChannelERIRepository,
     structured_eri: StructuredERIRepository,
 ) -> tuple[np.ndarray, np.ndarray]:
     spherical_alpha = build_spherical_density_component(density_alpha, mol)
@@ -741,12 +1067,12 @@ def build_uhf_fock_atomic_decomposed(
     residual_alpha = density_alpha - spherical_alpha
     residual_beta = density_beta - spherical_beta
 
-    fock_alpha, fock_beta = build_uhf_fock_from_reduced_radial_eri(
+    fock_alpha, fock_beta = build_uhf_fock_from_gaunt_channels(
         h_core,
         spherical_alpha,
         spherical_beta,
         mol,
-        reduced_eri,
+        gaunt_eri,
     )
 
     if np.linalg.norm(residual_alpha) > 1.0e-14 or np.linalg.norm(residual_beta) > 1.0e-14:
@@ -907,17 +1233,29 @@ def compute_uhf_s2(
 ) -> tuple[float, float, float]:
     if mo_occ_alpha is None:
         occ_alpha = coeff_alpha[:, :nalpha]
+        occ_weights_alpha = np.ones(occ_alpha.shape[1])
     else:
-        occ_alpha = coeff_alpha[:, mo_occ_alpha > 1.0e-12]
+        alpha_mask = mo_occ_alpha > 1.0e-12
+        occ_alpha = coeff_alpha[:, alpha_mask]
+        occ_weights_alpha = np.asarray(mo_occ_alpha[alpha_mask], dtype=float)
     if mo_occ_beta is None:
         occ_beta = coeff_beta[:, :nbeta]
+        occ_weights_beta = np.ones(occ_beta.shape[1])
     else:
-        occ_beta = coeff_beta[:, mo_occ_beta > 1.0e-12]
+        beta_mask = mo_occ_beta > 1.0e-12
+        occ_beta = coeff_beta[:, beta_mask]
+        occ_weights_beta = np.asarray(mo_occ_beta[beta_mask], dtype=float)
     if nalpha == 0 or nbeta == 0:
         overlap_occ = 0.0
     else:
         spin_overlap = occ_alpha.T @ overlap @ occ_beta
-        overlap_occ = float(np.sum(np.abs(spin_overlap) ** 2))
+        overlap_occ = float(
+            np.sum(
+                occ_weights_alpha[:, None]
+                * occ_weights_beta[None, :]
+                * np.abs(spin_overlap) ** 2
+            )
+        )
 
     sz = 0.5 * (nalpha - nbeta)
     s2 = sz * (sz + 1.0) + nbeta - overlap_occ
@@ -971,6 +1309,7 @@ def analyze_two_electron_integrals(
 ) -> dict[str, object]:
     structured_eri = build_structured_eri_repository(mol, eri, threshold=threshold)
     reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri, threshold=threshold)
+    gaunt_channel_eri = build_gaunt_channel_eri_repository(mol, eri, threshold=threshold)
     active_quartet_map = {quartet.l_values: quartet for quartet in structured_eri.active_quartets}
 
     ao_ang = ao_angular_momentum_for_each_ao(mol)
@@ -1048,6 +1387,39 @@ def analyze_two_electron_integrals(
         key=lambda item: max(item["coulomb_frobenius_norm"], item["exchange_frobenius_norm"]),
         reverse=True,
     )
+    gaunt_channel_summaries: list[dict[str, object]] = []
+    for _, pair_block in sorted(gaunt_channel_eri.pair_blocks.items()):
+        for k_value, tensor in sorted(pair_block.coulomb_channels.items()):
+            gaunt_channel_summaries.append(
+                {
+                    "type": "coulomb",
+                    "labels": [pair_block.output_label, pair_block.density_label],
+                    "l_values": [pair_block.l_output, pair_block.l_density],
+                    "k": k_value,
+                    "shape": list(tensor.shape),
+                    "weight": pair_block.coulomb_weights[k_value],
+                    "max_abs": float(np.max(np.abs(tensor))),
+                    "frobenius_norm": float(np.linalg.norm(tensor)),
+                }
+            )
+        for k_value, tensor in sorted(pair_block.exchange_channels.items()):
+            gaunt_channel_summaries.append(
+                {
+                    "type": "exchange",
+                    "labels": [pair_block.output_label, pair_block.density_label],
+                    "l_values": [pair_block.l_output, pair_block.l_density],
+                    "k": k_value,
+                    "shape": list(tensor.shape),
+                    "weight": pair_block.exchange_weights[k_value],
+                    "max_abs": float(np.max(np.abs(tensor))),
+                    "frobenius_norm": float(np.linalg.norm(tensor)),
+                }
+            )
+    dominant_gaunt_channels = sorted(
+        gaunt_channel_summaries,
+        key=lambda item: item["frobenius_norm"],
+        reverse=True,
+    )
     return {
         "threshold": threshold,
         "total_angular_quartets": len(quartet_summaries),
@@ -1061,8 +1433,11 @@ def analyze_two_electron_integrals(
             if reduced_radial_eri.pair_blocks
             else 1.0
         ),
+        "gaunt_channel_terms": len(gaunt_channel_summaries),
         "dominant_reduced_radial_pairs": dominant_reduced_pairs[:12],
+        "dominant_gaunt_channels": dominant_gaunt_channels[:12],
         "dominant_active_quartets": active_sorted[:12],
         "quartet_summaries": quartet_summaries,
         "reduced_radial_pair_summaries": reduced_pair_summaries,
+        "gaunt_channel_summaries": gaunt_channel_summaries,
     }

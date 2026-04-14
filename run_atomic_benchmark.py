@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from atomic_hf.benchmark import run_benchmark_sweep, write_benchmark_json
+from atomic_hf.benchmark import run_benchmark_sweep, run_benchmark_sweep_checkpointed, write_benchmark_json
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,7 +22,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the PySCF reference calculation and only time the local implementation.",
     )
+    parser.add_argument(
+        "--entry-timeout",
+        type=int,
+        default=60,
+        help="Per-element timeout in seconds before marking the entry as failed and moving on.",
+    )
     parser.add_argument("--json-output", type=str, default=None, help="Optional path for a JSON benchmark report.")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="When writing JSON, start a fresh sweep instead of resuming from an existing checkpoint file.",
+    )
     return parser
 
 
@@ -32,13 +43,26 @@ def main() -> None:
     if args.min_z < 1 or args.max_z < args.min_z:
         parser.error("Require 1 <= --min-z <= --max-z.")
 
-    summary = run_benchmark_sweep(
-        min_z=args.min_z,
-        max_z=args.max_z,
-        basis=args.basis,
-        method=args.method,
-        compare_reference=not args.no_reference,
-    )
+    if args.json_output:
+        summary = run_benchmark_sweep_checkpointed(
+            output_path=args.json_output,
+            min_z=args.min_z,
+            max_z=args.max_z,
+            basis=args.basis,
+            method=args.method,
+            compare_reference=not args.no_reference,
+            resume=not args.no_resume,
+            timeout_seconds=args.entry_timeout,
+        )
+    else:
+        summary = run_benchmark_sweep(
+            min_z=args.min_z,
+            max_z=args.max_z,
+            basis=args.basis,
+            method=args.method,
+            compare_reference=not args.no_reference,
+            timeout_seconds=args.entry_timeout,
+        )
     print("Atomic HF Benchmark")
     print(f"Range: Z = {summary['range'][0]} .. {summary['range'][1]}")
     print(f"Basis: {summary['basis']}")

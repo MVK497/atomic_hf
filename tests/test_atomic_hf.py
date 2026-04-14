@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from pathlib import Path
 from pyscf import gto
 from pyscf import scf
 from pyscf.scf import atom_hf as pyscf_atom_hf
@@ -15,13 +16,18 @@ from atomic_hf import (
     run_atomic_rhf,
     run_atomic_uhf,
 )
+from atomic_hf.benchmark import load_benchmark_json, run_benchmark_sweep_checkpointed
 from atomic_hf.blocks import (
     build_active_eri_quartets,
     build_fock,
     build_fock_from_active_quartets,
+    build_gaunt_channel_eri_repository,
     build_reduced_radial_eri_repository,
+    build_rhf_fock_from_gaunt_channels,
     build_rhf_fock_from_reduced_radial_eri,
+    build_spherical_density_component,
     build_structured_eri_repository,
+    build_uhf_fock_from_gaunt_channels,
     build_uhf_fock,
     build_uhf_fock_atomic_decomposed,
     build_uhf_fock_from_active_quartets,
@@ -113,11 +119,35 @@ def test_basis_engineering_detects_general_contraction() -> None:
     assert summary["shell_summaries"][0]["contraction_signature"] == "3->2"
 
 
+def test_basis_engineering_handles_dyall_style_shell_metadata() -> None:
+    mol = build_atomic_molecule(AtomicSpec(symbol="Al", basis="dyall_v2z", spin=1))
+    summary = analyze_basis_engineering(mol)
+    assert summary["total_shells"] > 0
+    assert summary["total_primitives"] >= summary["total_contracted_radial_functions"]
+
+
 def test_small_benchmark_sweep_runs() -> None:
     summary = run_benchmark_sweep(min_z=1, max_z=3, basis="sto-3g", method="auto", compare_reference=False)
     assert summary["successful_cases"] == 3
     assert summary["failed_cases"] == 0
     assert len(summary["entries"]) == 3
+
+
+def test_checkpointed_benchmark_writes_json(tmp_path: Path) -> None:
+    output_path = tmp_path / "bench.json"
+    summary = run_benchmark_sweep_checkpointed(
+        output_path=output_path,
+        min_z=1,
+        max_z=2,
+        basis="sto-3g",
+        method="auto",
+        compare_reference=False,
+        resume=False,
+    )
+    saved = load_benchmark_json(output_path)
+    assert summary["successful_cases"] == 2
+    assert saved["successful_cases"] == 2
+    assert len(saved["entries"]) == 2
 
 
 def test_quartet_screened_rhf_fock_matches_dense_builder() -> None:
@@ -153,6 +183,19 @@ def test_reduced_radial_rhf_fock_matches_dense_builder_for_spherical_density() -
     reduced_fock = build_rhf_fock_from_reduced_radial_eri(h_core, result.density, mol, reduced_radial_eri)
 
     assert np.allclose(reduced_fock, dense_fock, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_gaunt_channel_rhf_fock_matches_dense_builder_for_spherical_density() -> None:
+    result = run_atomic_rhf(AtomicSpec(symbol="Ne", basis="sto-3g", spin=0))
+    mol = build_atomic_molecule(AtomicSpec(symbol="Ne", basis="sto-3g", spin=0))
+    h_core = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+    eri = mol.intor("int2e")
+    gaunt_eri = build_gaunt_channel_eri_repository(mol, eri)
+
+    dense_fock = build_fock(h_core, eri, result.density)
+    gaunt_fock = build_rhf_fock_from_gaunt_channels(h_core, result.density, mol, gaunt_eri)
+
+    assert np.allclose(gaunt_fock, dense_fock, atol=1.0e-12, rtol=1.0e-12)
 
 
 def test_quartet_screened_uhf_fock_matches_dense_builder() -> None:
@@ -218,7 +261,7 @@ def test_atomic_decomposed_uhf_fock_matches_dense_builder() -> None:
     )
     density_alpha = 0.5 * (density_alpha + density_alpha.T)
     density_beta = 0.5 * (density_beta + density_beta.T)
-    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
+    gaunt_eri = build_gaunt_channel_eri_repository(mol, eri)
     structured_eri = build_structured_eri_repository(mol, eri)
 
     dense_alpha, dense_beta = build_uhf_fock(h_core, eri, density_alpha, density_beta)
@@ -227,9 +270,37 @@ def test_atomic_decomposed_uhf_fock_matches_dense_builder() -> None:
         density_alpha,
         density_beta,
         mol,
-        reduced_radial_eri,
+        gaunt_eri,
         structured_eri,
     )
 
     assert np.allclose(decomposed_alpha, dense_alpha, atol=1.0e-12, rtol=1.0e-12)
     assert np.allclose(decomposed_beta, dense_beta, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_atomic_uhf_spherical_average_mode_uses_fractional_open_shell_occupations() -> None:
+    result = run_atomic_uhf(AtomicSpec(symbol="O", basis="sto-3g", spin=2), occupation_mode="spherical_average")
+    assert result.occupation_mode == "spherical_average"
+    assert np.isclose(result.mo_occupations_beta[-1], 1.0 / 3.0)
+    assert np.allclose(result.mo_occupations_beta[-3:], np.full(3, 1.0 / 3.0))
+
+
+def test_gaunt_channel_uhf_fock_matches_dense_builder_for_spherical_parts() -> None:
+    result = run_atomic_uhf(AtomicSpec(symbol="O", basis="sto-3g", spin=2))
+    mol = build_atomic_molecule(AtomicSpec(symbol="O", basis="sto-3g", spin=2))
+    h_core = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+    eri = mol.intor("int2e")
+    gaunt_eri = build_gaunt_channel_eri_repository(mol, eri)
+    spherical_alpha = build_spherical_density_component(result.density_alpha, mol)
+    spherical_beta = build_spherical_density_component(result.density_beta, mol)
+    dense_alpha, dense_beta = build_uhf_fock(h_core, eri, spherical_alpha, spherical_beta)
+    gaunt_alpha, gaunt_beta = build_uhf_fock_from_gaunt_channels(
+        h_core,
+        spherical_alpha,
+        spherical_beta,
+        mol,
+        gaunt_eri,
+    )
+
+    assert np.allclose(gaunt_alpha, dense_alpha, atol=1.0e-12, rtol=1.0e-12)
+    assert np.allclose(gaunt_beta, dense_beta, atol=1.0e-12, rtol=1.0e-12)

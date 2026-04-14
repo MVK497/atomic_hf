@@ -36,6 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--damping", type=float, default=0.2, help="Density damping factor used in early cycles.")
     parser.add_argument("--damping-cycles", type=int, default=None, help="Number of early iterations to damp.")
     parser.add_argument("--level-shift", type=float, default=0.5, help="Virtual-space level shift in Hartree.")
+    parser.add_argument(
+        "--occupation-mode",
+        type=str,
+        default="integer",
+        choices=["spherical_average", "integer"],
+        help="For UHF, either keep atomic shell occupations spherically averaged or fill individual m orbitals.",
+    )
     parser.add_argument("--show-history", action="store_true", help="Print SCF energy history.")
     return parser
 
@@ -110,6 +117,7 @@ def print_two_electron_integral_summary(summary: dict[str, object]) -> None:
     print(f"  Unique canonical quartet blocks: {summary['unique_canonical_blocks']}")
     print(f"  Active reduced radial pair blocks: {summary['active_reduced_radial_pair_blocks']}")
     print(f"  Quartet-to-pair compression ratio: {summary['reduced_pair_compression_ratio']:.3f}")
+    print(f"  Gaunt/Wigner channel terms: {summary['gaunt_channel_terms']}")
     print("  Dominant active quartets:")
     for quartet in summary["dominant_active_quartets"]:
         labels = ",".join(quartet["labels"])
@@ -128,6 +136,14 @@ def print_two_electron_integral_summary(summary: dict[str, object]) -> None:
             f"max|K| = {pair_block['exchange_max_abs']:.3e}, "
             f"||J|| = {pair_block['coulomb_frobenius_norm']:.3e}, "
             f"||K|| = {pair_block['exchange_frobenius_norm']:.3e}"
+        )
+    print("  Dominant Gaunt/Wigner channels:")
+    for channel in summary["dominant_gaunt_channels"]:
+        labels = ",".join(channel["labels"])
+        print(
+            f"    ({labels}) {channel['type']} k={channel['k']}: "
+            f"shape = {channel['shape']}, weight = {channel['weight']:.3e}, "
+            f"max|T| = {channel['max_abs']:.3e}, ||T|| = {channel['frobenius_norm']:.3e}"
         )
 
 
@@ -207,6 +223,7 @@ def print_uhf_result(result: AtomicUHFResult, show_history: bool) -> None:
     print(f"Spin (2S): {result.spin}")
     print("Blocked atomic solver: True")
     print(f"Initial guess: {result.initial_guess}")
+    print(f"Occupation mode: {result.occupation_mode}")
     print(f"Alpha electrons: {result.nalpha}")
     print(f"Beta electrons: {result.nbeta}")
     print(f"SCF iterations: {result.iterations}")
@@ -301,5 +318,6 @@ def main() -> None:
         damping_cycles=args.damping_cycles if args.damping_cycles is not None else 6,
         level_shift=args.level_shift,
         diis_start_cycle=args.diis_start if args.diis_start is not None else 3,
+        occupation_mode=args.occupation_mode,
     )
     print_uhf_result(result, args.show_history)

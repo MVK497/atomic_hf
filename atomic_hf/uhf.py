@@ -20,7 +20,7 @@ from .blocks import (
     analyze_two_electron_integrals,
     blocked_generalized_eigh,
     build_atomic_reference_density,
-    build_reduced_radial_eri_repository,
+    build_gaunt_channel_eri_repository,
     build_spin_density_from_block_occupations,
     build_spin_population_by_l,
     build_uhf_fock_atomic_decomposed,
@@ -65,6 +65,7 @@ class AtomicUHFResult:
     one_center_integral_summary: dict[str, object]
     two_electron_integral_summary: dict[str, object]
     initial_guess: str
+    occupation_mode: str
     stabilization_summary: dict[str, object]
     fock_build_summary: dict[str, object]
 
@@ -81,6 +82,8 @@ def run_atomic_uhf(
     damping_cycles: int = 6,
     level_shift: float = 0.5,
     diis_start_cycle: int = 3,
+    occupation_mode: str = "integer",
+    with_analysis: bool = True,
 ) -> AtomicUHFResult:
     resolved_spin = resolve_spin(spec)
 
@@ -93,7 +96,7 @@ def run_atomic_uhf(
     eri = mol.intor("int2e")
     h_core = t + v
     e_nuc = float(mol.energy_nuc())
-    reduced_radial_eri = build_reduced_radial_eri_repository(mol, eri)
+    gaunt_channel_eri = build_gaunt_channel_eri_repository(mol, eri)
     structured_eri = build_structured_eri_repository(mol, eri)
 
     overlap_eigvals, overlap_eigvecs = np.linalg.eigh(s)
@@ -110,11 +113,13 @@ def run_atomic_uhf(
         coefficients_alpha,
         symmetry_blocks_alpha,
         alpha_by_l,
+        mode=occupation_mode,
     )
     density_beta_core, mo_occ_beta = build_spin_density_from_block_occupations(
         coefficients_beta,
         symmetry_blocks_beta,
         beta_by_l,
+        mode=occupation_mode,
     )
     if initial_guess == "atom":
         density_total = build_atomic_reference_density(mol)
@@ -136,7 +141,7 @@ def run_atomic_uhf(
             density_alpha,
             density_beta,
             mol,
-            reduced_radial_eri,
+            gaunt_channel_eri,
             structured_eri,
         )
         if use_diis and iteration >= diis_start_cycle:
@@ -163,11 +168,13 @@ def run_atomic_uhf(
             coefficients_alpha,
             symmetry_blocks_alpha,
             alpha_by_l,
+            mode=occupation_mode,
         )
         new_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
             coefficients_beta,
             symmetry_blocks_beta,
             beta_by_l,
+            mode=occupation_mode,
         )
         if damping_factor > 0.0 and iteration <= damping_cycles:
             new_density_alpha = damp_density(density_alpha, new_density_alpha, damping_factor)
@@ -177,7 +184,7 @@ def run_atomic_uhf(
             new_density_alpha,
             new_density_beta,
             mol,
-            reduced_radial_eri,
+            gaunt_channel_eri,
             structured_eri,
         )
 
@@ -206,11 +213,13 @@ def run_atomic_uhf(
                 coefficients_alpha,
                 symmetry_blocks_alpha,
                 alpha_by_l,
+                mode=occupation_mode,
             )
             final_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
                 coefficients_beta,
                 symmetry_blocks_beta,
                 beta_by_l,
+                mode=occupation_mode,
             )
             s2, expected_s2, spin_contamination = compute_uhf_s2(
                 s,
@@ -244,14 +253,15 @@ def run_atomic_uhf(
                 s2=float(s2),
                 expected_s2=float(expected_s2),
                 spin_contamination=float(spin_contamination),
-                basis_summary=summarize_basis_shells(mol),
-                basis_engineering_summary=analyze_basis_engineering(mol),
+                basis_summary=summarize_basis_shells(mol) if with_analysis else [],
+                basis_engineering_summary=analyze_basis_engineering(mol) if with_analysis else {},
                 configuration_summary=configuration_summary,
                 symmetry_blocks_alpha=symmetry_blocks_alpha,
                 symmetry_blocks_beta=symmetry_blocks_beta,
-                one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core),
-                two_electron_integral_summary=analyze_two_electron_integrals(mol, eri),
+                one_center_integral_summary=analyze_one_center_integrals(mol, s, h_core) if with_analysis else {},
+                two_electron_integral_summary=analyze_two_electron_integrals(mol, eri) if with_analysis else {},
                 initial_guess=initial_guess,
+                occupation_mode=occupation_mode,
                 stabilization_summary={
                     "use_diis": use_diis,
                     "diis_space": diis_space,
@@ -261,8 +271,8 @@ def run_atomic_uhf(
                     "level_shift": level_shift,
                 },
                 fock_build_summary={
-                    "builder": "reduced_radial_plus_residual_quartets",
-                    "active_reduced_radial_pair_blocks": len(reduced_radial_eri.pair_blocks),
+                    "builder": "gaunt_channel_plus_residual_quartets",
+                    "active_reduced_radial_pair_blocks": len(gaunt_channel_eri.pair_blocks),
                     "active_angular_quartets": len(structured_eri.active_quartets),
                     "unique_canonical_blocks": len(structured_eri.block_map),
                 },
@@ -272,4 +282,20 @@ def run_atomic_uhf(
         density_beta = new_density_beta
         previous_energy = total_energy
 
+    if occupation_mode == "integer":
+        return run_atomic_uhf(
+            spec,
+            max_iter=max_iter,
+            e_tol=e_tol,
+            d_tol=d_tol,
+            use_diis=use_diis,
+            diis_space=diis_space,
+            initial_guess=initial_guess,
+            damping_factor=damping_factor,
+            damping_cycles=damping_cycles,
+            level_shift=level_shift,
+            diis_start_cycle=diis_start_cycle,
+            occupation_mode="spherical_average",
+            with_analysis=with_analysis,
+        )
     raise RuntimeError("Blocked atomic UHF did not converge within the iteration limit.")
