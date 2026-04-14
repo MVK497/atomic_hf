@@ -462,6 +462,16 @@ def build_spin_density_from_block_occupations(
     return build_density_from_occupations(coefficients, occupations), occupations
 
 
+def build_spin_density_from_energy_order(
+    orbital_energies: np.ndarray,
+    coefficients: np.ndarray,
+    num_occupied: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    sorted_energies, sorted_coefficients = sort_orbitals_by_energy(orbital_energies, coefficients)
+    density, occupations = build_spin_density_from_count(sorted_coefficients, num_occupied)
+    return density, occupations, sorted_energies, sorted_coefficients
+
+
 def damp_density(
     previous_density: np.ndarray,
     new_density: np.ndarray,

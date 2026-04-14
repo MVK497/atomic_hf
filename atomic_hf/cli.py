@@ -40,8 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--occupation-mode",
         type=str,
         default="integer",
-        choices=["spherical_average", "integer"],
-        help="For UHF, either keep atomic shell occupations spherically averaged or fill individual m orbitals.",
+        choices=["spherical_average", "integer", "energy_order"],
+        help="For UHF, choose integer shell filling, spherical-average filling, or global energy-ordered filling.",
     )
     parser.add_argument("--show-history", action="store_true", help="Print SCF energy history.")
     return parser

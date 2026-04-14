@@ -20,6 +20,7 @@ from .blocks import (
     analyze_two_electron_integrals,
     blocked_generalized_eigh,
     build_atomic_reference_density,
+    build_spin_density_from_energy_order,
     build_gaunt_channel_eri_repository,
     build_spin_density_from_block_occupations,
     build_spin_population_by_l,
@@ -109,18 +110,30 @@ def run_atomic_uhf(
 
     alpha_by_l, beta_by_l = build_spin_population_by_l(spec)
     alpha_by_l, beta_by_l = rebalance_spin_population_by_l(alpha_by_l, beta_by_l, nalpha, nbeta)
-    density_alpha_core, mo_occ_alpha = build_spin_density_from_block_occupations(
-        coefficients_alpha,
-        symmetry_blocks_alpha,
-        alpha_by_l,
-        mode=occupation_mode,
-    )
-    density_beta_core, mo_occ_beta = build_spin_density_from_block_occupations(
-        coefficients_beta,
-        symmetry_blocks_beta,
-        beta_by_l,
-        mode=occupation_mode,
-    )
+    if occupation_mode == "energy_order":
+        density_alpha_core, mo_occ_alpha, orbital_energies_alpha, coefficients_alpha = build_spin_density_from_energy_order(
+            orbital_energies_alpha,
+            coefficients_alpha,
+            nalpha,
+        )
+        density_beta_core, mo_occ_beta, orbital_energies_beta, coefficients_beta = build_spin_density_from_energy_order(
+            orbital_energies_beta,
+            coefficients_beta,
+            nbeta,
+        )
+    else:
+        density_alpha_core, mo_occ_alpha = build_spin_density_from_block_occupations(
+            coefficients_alpha,
+            symmetry_blocks_alpha,
+            alpha_by_l,
+            mode=occupation_mode,
+        )
+        density_beta_core, mo_occ_beta = build_spin_density_from_block_occupations(
+            coefficients_beta,
+            symmetry_blocks_beta,
+            beta_by_l,
+            mode=occupation_mode,
+        )
     if initial_guess == "atom":
         density_total = build_atomic_reference_density(mol)
         spin_density = density_alpha_core - density_beta_core
@@ -164,18 +177,40 @@ def run_atomic_uhf(
             fock_beta_to_diag, s, mol
         )
 
-        new_density_alpha, mo_occ_alpha = build_spin_density_from_block_occupations(
-            coefficients_alpha,
-            symmetry_blocks_alpha,
-            alpha_by_l,
-            mode=occupation_mode,
-        )
-        new_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
-            coefficients_beta,
-            symmetry_blocks_beta,
-            beta_by_l,
-            mode=occupation_mode,
-        )
+        if occupation_mode == "energy_order":
+            (
+                new_density_alpha,
+                mo_occ_alpha,
+                orbital_energies_alpha,
+                coefficients_alpha,
+            ) = build_spin_density_from_energy_order(
+                orbital_energies_alpha,
+                coefficients_alpha,
+                nalpha,
+            )
+            (
+                new_density_beta,
+                mo_occ_beta,
+                orbital_energies_beta,
+                coefficients_beta,
+            ) = build_spin_density_from_energy_order(
+                orbital_energies_beta,
+                coefficients_beta,
+                nbeta,
+            )
+        else:
+            new_density_alpha, mo_occ_alpha = build_spin_density_from_block_occupations(
+                coefficients_alpha,
+                symmetry_blocks_alpha,
+                alpha_by_l,
+                mode=occupation_mode,
+            )
+            new_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
+                coefficients_beta,
+                symmetry_blocks_beta,
+                beta_by_l,
+                mode=occupation_mode,
+            )
         if damping_factor > 0.0 and iteration <= damping_cycles:
             new_density_alpha = damp_density(density_alpha, new_density_alpha, damping_factor)
             new_density_beta = damp_density(density_beta, new_density_beta, damping_factor)
@@ -209,18 +244,40 @@ def run_atomic_uhf(
             orbital_energies_beta, coefficients_beta, symmetry_blocks_beta = blocked_generalized_eigh(
                 new_fock_beta, s, mol
             )
-            final_density_alpha, mo_occ_alpha = build_spin_density_from_block_occupations(
-                coefficients_alpha,
-                symmetry_blocks_alpha,
-                alpha_by_l,
-                mode=occupation_mode,
-            )
-            final_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
-                coefficients_beta,
-                symmetry_blocks_beta,
-                beta_by_l,
-                mode=occupation_mode,
-            )
+            if occupation_mode == "energy_order":
+                (
+                    final_density_alpha,
+                    mo_occ_alpha,
+                    orbital_energies_alpha,
+                    coefficients_alpha,
+                ) = build_spin_density_from_energy_order(
+                    orbital_energies_alpha,
+                    coefficients_alpha,
+                    nalpha,
+                )
+                (
+                    final_density_beta,
+                    mo_occ_beta,
+                    orbital_energies_beta,
+                    coefficients_beta,
+                ) = build_spin_density_from_energy_order(
+                    orbital_energies_beta,
+                    coefficients_beta,
+                    nbeta,
+                )
+            else:
+                final_density_alpha, mo_occ_alpha = build_spin_density_from_block_occupations(
+                    coefficients_alpha,
+                    symmetry_blocks_alpha,
+                    alpha_by_l,
+                    mode=occupation_mode,
+                )
+                final_density_beta, mo_occ_beta = build_spin_density_from_block_occupations(
+                    coefficients_beta,
+                    symmetry_blocks_beta,
+                    beta_by_l,
+                    mode=occupation_mode,
+                )
             s2, expected_s2, spin_contamination = compute_uhf_s2(
                 s,
                 coefficients_alpha,
@@ -283,6 +340,22 @@ def run_atomic_uhf(
         previous_energy = total_energy
 
     if occupation_mode == "integer":
+        return run_atomic_uhf(
+            spec,
+            max_iter=max_iter,
+            e_tol=e_tol,
+            d_tol=d_tol,
+            use_diis=use_diis,
+            diis_space=diis_space,
+            initial_guess=initial_guess,
+            damping_factor=damping_factor,
+            damping_cycles=damping_cycles,
+            level_shift=level_shift,
+            diis_start_cycle=diis_start_cycle,
+            occupation_mode="energy_order",
+            with_analysis=with_analysis,
+        )
+    if occupation_mode == "energy_order":
         return run_atomic_uhf(
             spec,
             max_iter=max_iter,

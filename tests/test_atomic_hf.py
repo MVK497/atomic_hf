@@ -285,6 +285,13 @@ def test_atomic_uhf_spherical_average_mode_uses_fractional_open_shell_occupation
     assert np.allclose(result.mo_occupations_beta[-3:], np.full(3, 1.0 / 3.0))
 
 
+def test_atomic_uhf_energy_order_mode_preserves_spin_electron_counts() -> None:
+    result = run_atomic_uhf(AtomicSpec(symbol="O", basis="sto-3g", spin=2), occupation_mode="energy_order")
+    assert result.occupation_mode == "energy_order"
+    assert np.isclose(np.sum(result.mo_occupations_alpha), result.nalpha)
+    assert np.isclose(np.sum(result.mo_occupations_beta), result.nbeta)
+
+
 def test_gaunt_channel_uhf_fock_matches_dense_builder_for_spherical_parts() -> None:
     result = run_atomic_uhf(AtomicSpec(symbol="O", basis="sto-3g", spin=2))
     mol = build_atomic_molecule(AtomicSpec(symbol="O", basis="sto-3g", spin=2))
